@@ -109,6 +109,7 @@ export default function AgentPage() {
   const handoffMessageTooLong = handoffMessageLength > HANDOFF_MESSAGE_LIMIT
   const formHasLengthError = systemPromptTooLong || businessContextTooLong || handoffMessageTooLong
   const selectedProfileId = form.id || null
+  const selectedModelInCatalog = modelOptions.some((model) => model.id === form.model)
   const providerSummary =
     modelProviders.length > 0
       ? modelProviders.map((item) => `${item.provider} (${item.count})`).join(', ')
@@ -325,14 +326,22 @@ export default function AgentPage() {
                   Atualizar lista
                 </button>
               </div>
-              <input list="agent-model-options" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} placeholder="Ex.: gpt-4.1-mini" className="h-11 w-full rounded-2xl border border-[#cad6e4] bg-white px-4 text-sm text-[#0d253d] outline-none transition focus:border-[#533afd]" />
-              <datalist id="agent-model-options">
-                {modelOptions.map((model) => (
-                  <option key={`${model.provider}:${model.id}`} value={model.id}>
-                    {model.provider} - {model.label}
-                  </option>
-                ))}
-              </datalist>
+              {modelOptions.length > 0 ? (
+                <select value={selectedModelInCatalog ? form.model : '__custom__'} onChange={(event) => {
+                  if (event.target.value === '__custom__') return
+                  setForm({ ...form, model: event.target.value })
+                }} className="h-11 w-full rounded-2xl border border-[#cad6e4] bg-white px-4 text-sm text-[#0d253d] outline-none transition focus:border-[#533afd]">
+                  {!selectedModelInCatalog ? <option value="__custom__">Modelo atual fora da lista: {form.model}</option> : null}
+                  {modelOptions.map((model) => (
+                    <option key={`${model.provider}:${model.id}`} value={model.id}>
+                      {model.provider} - {model.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} placeholder="Ex.: gpt-4.1-mini" className="h-11 w-full rounded-2xl border border-[#cad6e4] bg-white px-4 text-sm text-[#0d253d] outline-none transition focus:border-[#533afd]" />
+              )}
+              <input value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} placeholder="Ou digite manualmente um modelo especifico" className="mt-2 h-11 w-full rounded-2xl border border-[#e1e8f0] bg-[#f8fbff] px-4 text-sm text-[#425466] outline-none transition focus:border-[#533afd]" />
               <p className="mt-2 text-xs text-[#64748d]">
                 {providerSummary
                   ? `Modelos carregados da API: ${providerSummary}.`
