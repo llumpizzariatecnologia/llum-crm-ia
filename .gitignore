@@ -35,7 +35,15 @@ yarn-error.log*
 
 # vercel
 .vercel
+VERCEL_DEPLOY.md
 
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+.vercel
+.cache/
+.cookies.txt
+*.err.log
+*.out.log
+supabase/.temp/
