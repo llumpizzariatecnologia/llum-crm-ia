@@ -133,6 +133,21 @@ export async function getPrimaryAgentProfile(workspaceId?: string) {
   return profiles.find((profile) => profile.status === 'active') || profiles[0] || null
 }
 
+async function demoteOtherAgentProfiles(workspace: string, currentProfileId?: string) {
+  const supabase = getServerSupabaseClient()
+  let query = supabase
+    .from('agent_profiles')
+    .update({ status: 'draft', is_default: false } as never)
+    .eq('workspace_id', workspace)
+    .eq('status', 'active')
+
+  if (currentProfileId) {
+    query = query.neq('id', currentProfileId)
+  }
+
+  await query
+}
+
 export async function saveAgentProfile(input: AgentProfileInput, workspaceId?: string) {
   const supabase = getServerSupabaseClient()
   const workspace = getWorkspaceId(workspaceId)
@@ -157,10 +172,7 @@ export async function saveAgentProfile(input: AgentProfileInput, workspaceId?: s
   }
 
   if (input.status === 'active') {
-    await supabase
-      .from('agent_profiles')
-      .update({ is_default: false } as never)
-      .eq('workspace_id', workspace)
+    await demoteOtherAgentProfiles(workspace, input.id)
   }
 
   if (input.id) {
@@ -186,6 +198,45 @@ export async function saveAgentProfile(input: AgentProfileInput, workspaceId?: s
 
   if (error) throw new Error(error.message)
   return data as AgentProfile
+}
+
+export async function deleteAgentProfile(profileId: string, workspaceId?: string) {
+  const supabase = getServerSupabaseClient()
+  const workspace = getWorkspaceId(workspaceId)
+
+  const { data: existing, error: existingError } = await supabase
+    .from('agent_profiles')
+    .select('*')
+    .eq('id', profileId)
+    .eq('workspace_id', workspace)
+    .maybeSingle()
+
+  if (existingError) throw new Error(existingError.message)
+  if (!existing) throw new Error('Perfil nao encontrado')
+
+  const { error: deleteError } = await supabase
+    .from('agent_profiles')
+    .delete()
+    .eq('id', profileId)
+    .eq('workspace_id', workspace)
+
+  if (deleteError) throw new Error(deleteError.message)
+
+  const remainingProfiles = await listAgentProfiles(workspace)
+  const hasActiveProfile = remainingProfiles.some((profile) => profile.status === 'active')
+
+  if (!hasActiveProfile && remainingProfiles[0]) {
+    const { error: promoteError } = await supabase
+      .from('agent_profiles')
+      .update({
+        status: 'active',
+        is_default: true,
+        updated_at: nowIso(),
+      } as never)
+      .eq('id', remainingProfiles[0].id)
+
+    if (promoteError) throw new Error(promoteError.message)
+  }
 }
 
 export async function listKnowledgeDocuments(workspaceId?: string) {

@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { Bot, Loader2, Save, Sparkles } from 'lucide-react'
+import { Bot, Loader2, PencilLine, Plus, RefreshCw, Save, Sparkles, Trash2 } from 'lucide-react'
 import { fetchJson } from '@/lib/client'
 
 const SYSTEM_PROMPT_LIMIT = 12000
@@ -23,6 +23,23 @@ type AgentProfileForm = {
   handoffOnUnknown: boolean
   maxResponseChars: number
   status: 'draft' | 'active' | 'archived'
+  updatedAt?: string
+}
+
+type AgentModelOption = {
+  id: string
+  provider: string
+  label: string
+}
+
+type AgentModelsResponse = {
+  models: AgentModelOption[]
+  providers: Array<{
+    provider: string
+    source: 'integration' | 'environment'
+    count: number
+  }>
+  errors: string[]
 }
 
 const defaultAgentProfileInput: AgentProfileForm = {
@@ -44,11 +61,43 @@ const defaultAgentProfileInput: AgentProfileForm = {
   status: 'active',
 }
 
+function buildNewProfile(seedModel?: string) {
+  return {
+    ...defaultAgentProfileInput,
+    id: undefined,
+    updatedAt: undefined,
+    name: 'Novo perfil LLUM',
+    assistantName: 'Maria',
+    status: 'draft' as const,
+    model: seedModel || defaultAgentProfileInput.model,
+  }
+}
+
+function formatUpdatedAt(value?: string) {
+  if (!value) return 'sem data'
+
+  try {
+    return new Date(value).toLocaleString('pt-BR', {
+      day: '2-digit',
+      month: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+  } catch {
+    return value
+  }
+}
+
 export default function AgentPage() {
   const [form, setForm] = useState<AgentProfileForm>(defaultAgentProfileInput)
   const [profiles, setProfiles] = useState<AgentProfileForm[]>([])
+  const [modelOptions, setModelOptions] = useState<AgentModelOption[]>([])
+  const [modelProviders, setModelProviders] = useState<AgentModelsResponse['providers']>([])
+  const [modelErrors, setModelErrors] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [deletingProfileId, setDeletingProfileId] = useState<string | null>(null)
+  const [modelsLoading, setModelsLoading] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -59,15 +108,53 @@ export default function AgentPage() {
   const businessContextTooLong = businessContextLength > BUSINESS_CONTEXT_LIMIT
   const handoffMessageTooLong = handoffMessageLength > HANDOFF_MESSAGE_LIMIT
   const formHasLengthError = systemPromptTooLong || businessContextTooLong || handoffMessageTooLong
+  const selectedProfileId = form.id || null
+  const providerSummary =
+    modelProviders.length > 0
+      ? modelProviders.map((item) => `${item.provider} (${item.count})`).join(', ')
+      : null
+
+  async function loadModels(options?: { silent?: boolean }) {
+    if (!options?.silent) {
+      setModelsLoading(true)
+    }
+
+    try {
+      const data = await fetchJson<AgentModelsResponse>('/api/agent/models')
+      setModelOptions(data.models)
+      setModelProviders(data.providers)
+      setModelErrors(data.errors)
+    } catch (err) {
+      setModelOptions([])
+      setModelProviders([])
+      setModelErrors([(err as Error).message])
+    } finally {
+      if (!options?.silent) {
+        setModelsLoading(false)
+      }
+    }
+  }
 
   useEffect(() => {
     let active = true
+
     const run = async () => {
       try {
-        const data = await fetchJson<{ profiles: AgentProfileForm[]; primary: AgentProfileForm }>('/api/agent')
+        const [agentData, modelsData] = await Promise.all([
+          fetchJson<{ profiles: AgentProfileForm[]; primary: AgentProfileForm }>('/api/agent'),
+          fetchJson<AgentModelsResponse>('/api/agent/models').catch(() => null),
+        ])
+
         if (!active) return
-        setProfiles(data.profiles)
-        setForm(data.primary)
+
+        setProfiles(agentData.profiles)
+        setForm(agentData.primary)
+
+        if (modelsData) {
+          setModelOptions(modelsData.models)
+          setModelProviders(modelsData.providers)
+          setModelErrors(modelsData.errors)
+        }
       } catch (err) {
         if (active) setError((err as Error).message)
       } finally {
@@ -80,6 +167,51 @@ export default function AgentPage() {
       active = false
     }
   }, [])
+
+  function startNewProfile() {
+    setError(null)
+    setMessage(null)
+    setForm(buildNewProfile(form.model || modelOptions[0]?.id))
+  }
+
+  function editProfile(profile: AgentProfileForm) {
+    setError(null)
+    setMessage(null)
+    setForm(profile)
+  }
+
+  async function deleteProfile(profile: AgentProfileForm) {
+    if (!profile.id) return
+
+    const confirmed = window.confirm(`Excluir o perfil "${profile.name}"?`)
+    if (!confirmed) return
+
+    setDeletingProfileId(profile.id)
+    setError(null)
+    setMessage(null)
+
+    try {
+      const data = await fetchJson<{
+        deletedId: string
+        profiles: AgentProfileForm[]
+        primary: AgentProfileForm
+      }>(`/api/agent?id=${profile.id}`, {
+        method: 'DELETE',
+      })
+
+      setProfiles(data.profiles)
+      setForm(
+        selectedProfileId === profile.id
+          ? data.primary || buildNewProfile(modelOptions[0]?.id)
+          : data.profiles.find((item) => item.id === selectedProfileId) || data.primary
+      )
+      setMessage('Perfil removido com sucesso.')
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setDeletingProfileId(null)
+    }
+  }
 
   async function save() {
     if (formHasLengthError) {
@@ -106,7 +238,7 @@ export default function AgentPage() {
       })
       setForm(data.profile)
       setProfiles(data.profiles)
-      setMessage('Perfil do agente salvo com sucesso.')
+      setMessage(form.id ? 'Perfil atualizado com sucesso.' : 'Perfil criado com sucesso.')
     } catch (err) {
       setError((err as Error).message)
     } finally {
@@ -134,12 +266,18 @@ export default function AgentPage() {
               Agente de IA
             </h1>
             <p className="mt-3 max-w-2xl text-[15px] leading-7 text-[#5e6d82]">
-              Aqui fica o comportamento do agente: persona, prompt principal, modelo, handoff e limites de resposta.
+              Edite o perfil ativo, mantenha variacoes salvas sem bagunca e escolha o modelo a partir dos providers conectados.
             </p>
           </div>
 
-          <div className="rounded-[24px] border border-[#dfe7f0] bg-[#f8fbff] px-4 py-3 text-sm text-[#425466]">
-            {profiles.length} perfil(is) no workspace
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="rounded-[24px] border border-[#dfe7f0] bg-[#f8fbff] px-4 py-3 text-sm text-[#425466]">
+              {profiles.length} perfil(is) no workspace
+            </div>
+            <button onClick={startNewProfile} className="inline-flex h-11 items-center justify-center gap-2 rounded-full border border-[#dfe7f0] bg-white px-4 text-sm font-medium text-[#0d253d] transition hover:border-[#533afd] hover:text-[#533afd]">
+              <Plus className="h-4 w-4" />
+              Novo perfil
+            </button>
           </div>
         </div>
       </section>
@@ -149,6 +287,23 @@ export default function AgentPage() {
 
       <div className="mt-6 grid gap-6 xl:grid-cols-[1fr_340px]">
         <section className="surface-card p-6">
+          <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-[24px] border border-[#e5edf6] bg-[#f8fbff] px-4 py-3">
+            <div>
+              <p className="text-sm font-medium text-[#0d253d]">
+                {form.id ? 'Editando perfil salvo' : 'Criando novo perfil'}
+              </p>
+              <p className="text-xs text-[#64748d]">
+                {form.id ? `Ultima atualizacao em ${formatUpdatedAt(form.updatedAt)}` : 'Esse perfil so sera listado depois do primeiro save.'}
+              </p>
+            </div>
+            {form.id ? (
+              <button onClick={startNewProfile} className="inline-flex items-center gap-2 rounded-full border border-[#dfe7f0] bg-white px-4 py-2 text-xs font-medium text-[#425466] transition hover:border-[#533afd] hover:text-[#533afd]">
+                <Plus className="h-4 w-4" />
+                Novo sem sobrescrever
+              </button>
+            ) : null}
+          </div>
+
           <div className="grid gap-4 md:grid-cols-2">
             <div>
               <label className="mb-1.5 block text-xs font-medium text-[#425466]">Nome do perfil</label>
@@ -163,8 +318,27 @@ export default function AgentPage() {
               <input value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} className="h-11 w-full rounded-2xl border border-[#cad6e4] bg-white px-4 text-sm text-[#0d253d] outline-none transition focus:border-[#533afd]" />
             </div>
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-[#425466]">Modelo</label>
-              <input value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} className="h-11 w-full rounded-2xl border border-[#cad6e4] bg-white px-4 text-sm text-[#0d253d] outline-none transition focus:border-[#533afd]" />
+              <div className="mb-1.5 flex items-center justify-between gap-3">
+                <label className="block text-xs font-medium text-[#425466]">Modelo</label>
+                <button onClick={() => void loadModels()} type="button" className="inline-flex items-center gap-1 text-xs font-medium text-[#533afd]">
+                  <RefreshCw className={`h-3.5 w-3.5 ${modelsLoading ? 'animate-spin' : ''}`} />
+                  Atualizar lista
+                </button>
+              </div>
+              <input list="agent-model-options" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} placeholder="Ex.: gpt-4.1-mini" className="h-11 w-full rounded-2xl border border-[#cad6e4] bg-white px-4 text-sm text-[#0d253d] outline-none transition focus:border-[#533afd]" />
+              <datalist id="agent-model-options">
+                {modelOptions.map((model) => (
+                  <option key={`${model.provider}:${model.id}`} value={model.id}>
+                    {model.provider} - {model.label}
+                  </option>
+                ))}
+              </datalist>
+              <p className="mt-2 text-xs text-[#64748d]">
+                {providerSummary
+                  ? `Modelos carregados da API: ${providerSummary}.`
+                  : 'Sem provider de IA conectado para sugerir modelos. O campo continua livre.'}
+              </p>
+              {modelErrors.length > 0 ? <p className="mt-1 text-xs text-[#c7245d]">{modelErrors[0]}</p> : null}
             </div>
             <div>
               <label className="mb-1.5 block text-xs font-medium text-[#425466]">Status</label>
@@ -196,7 +370,7 @@ export default function AgentPage() {
                 {systemPromptLength}/{SYSTEM_PROMPT_LIMIT}
               </span>
             </div>
-            <textarea rows={8} value={form.systemPrompt} onChange={(event) => setForm({ ...form, systemPrompt: event.target.value })} className={`w-full rounded-2xl border bg-white px-4 py-3 text-sm leading-6 text-[#0d253d] outline-none transition ${systemPromptTooLong ? 'border-[#f3a5bf] focus:border-[#c7245d]' : 'border-[#cad6e4] focus:border-[#533afd]'}`} />
+            <textarea rows={10} value={form.systemPrompt} onChange={(event) => setForm({ ...form, systemPrompt: event.target.value })} className={`w-full rounded-2xl border bg-white px-4 py-3 text-sm leading-6 text-[#0d253d] outline-none transition ${systemPromptTooLong ? 'border-[#f3a5bf] focus:border-[#c7245d]' : 'border-[#cad6e4] focus:border-[#533afd]'}`} />
             {systemPromptTooLong ? <p className="mt-2 text-xs text-[#c7245d]">Reduza o texto para salvar esse perfil.</p> : null}
           </div>
 
@@ -240,10 +414,18 @@ export default function AgentPage() {
             </button>
           </div>
 
-          <button onClick={save} disabled={saving || formHasLengthError} className="mt-5 inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#533afd] px-5 text-sm font-medium text-white transition hover:bg-[#4434d4] disabled:opacity-60">
-            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-            Salvar perfil do agente
-          </button>
+          <div className="mt-5 flex flex-wrap items-center gap-3">
+            <button onClick={save} disabled={saving || formHasLengthError} className="inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#533afd] px-5 text-sm font-medium text-white transition hover:bg-[#4434d4] disabled:opacity-60">
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+              {form.id ? 'Atualizar perfil' : 'Criar perfil'}
+            </button>
+            {form.id ? (
+              <button onClick={() => void deleteProfile(form)} disabled={deletingProfileId === form.id} className="inline-flex h-12 items-center justify-center gap-2 rounded-full border border-[#f1c7d5] bg-white px-5 text-sm font-medium text-[#c7245d] transition hover:bg-[#fff5f8] disabled:opacity-60">
+                {deletingProfileId === form.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                Excluir perfil
+              </button>
+            ) : null}
+          </div>
         </section>
 
         <aside className="space-y-6">
@@ -253,19 +435,48 @@ export default function AgentPage() {
                 <Bot className="h-5 w-5" />
               </div>
               <div>
-                <h2 className="heading-card">Perfis existentes</h2>
-                <p className="text-sm text-[#64748d]">Use como base sem misturar canais.</p>
+                <h2 className="heading-card">Perfis salvos</h2>
+                <p className="text-sm text-[#64748d]">Edite ou exclua perfis de forma explicita.</p>
               </div>
             </div>
 
             <div className="mt-4 space-y-3">
               {profiles.length === 0 ? <p className="text-sm text-[#7a8ca2]">Nenhum perfil salvo ainda.</p> : null}
-              {profiles.map((profile) => (
-                <button key={profile.id || profile.name} onClick={() => setForm(profile)} className="w-full rounded-2xl border border-[#e6edf5] bg-[#f8fbff] px-4 py-3 text-left">
-                  <p className="text-sm font-medium text-[#0d253d]">{profile.name}</p>
-                  <p className="mt-1 text-xs text-[#64748d]">{profile.model} - {profile.status}</p>
-                </button>
-              ))}
+              {profiles.map((profile) => {
+                const selected = profile.id === selectedProfileId
+
+                return (
+                  <div key={profile.id || profile.name} className={`rounded-2xl border px-4 py-3 transition ${selected ? 'border-[#533afd] bg-[#f5f2ff]' : 'border-[#e6edf5] bg-[#f8fbff]'}`}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-medium text-[#0d253d]">{profile.name}</p>
+                        <p className="mt-1 text-xs text-[#64748d]">
+                          {profile.model} - {profile.status}
+                        </p>
+                        <p className="mt-1 text-[11px] text-[#8a97a8]">
+                          Atualizado em {formatUpdatedAt(profile.updatedAt)}
+                        </p>
+                      </div>
+                      {profile.status === 'active' ? (
+                        <span className="rounded-full bg-[#e7f8ed] px-2.5 py-1 text-[11px] font-medium text-[#17884b]">
+                          principal
+                        </span>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-3 flex items-center gap-2">
+                      <button onClick={() => editProfile(profile)} className="inline-flex items-center gap-2 rounded-full border border-[#dfe7f0] bg-white px-3 py-2 text-xs font-medium text-[#425466] transition hover:border-[#533afd] hover:text-[#533afd]">
+                        <PencilLine className="h-3.5 w-3.5" />
+                        Editar
+                      </button>
+                      <button onClick={() => void deleteProfile(profile)} disabled={deletingProfileId === profile.id} className="inline-flex items-center gap-2 rounded-full border border-[#f1c7d5] bg-white px-3 py-2 text-xs font-medium text-[#c7245d] transition hover:bg-[#fff5f8] disabled:opacity-60">
+                        {deletingProfileId === profile.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                        Excluir
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
             </div>
           </div>
 
