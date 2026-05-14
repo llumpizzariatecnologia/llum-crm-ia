@@ -281,28 +281,6 @@ export interface CrmSettings {
   closingMessage?: string
 }
 
-export interface DiagnosticsSnapshot {
-  last_webhook: WebhookEvent | null
-  last_customer: Customer | null
-  last_conversation: Conversation | null
-  last_inbound: Interaction | null
-  last_outbound: Interaction | null
-  last_ai_run: AgentRun | null
-  last_lead: Lead | null
-  last_handoff: Handoff | null
-  last_error: AgentRun | null
-  avg_response_time_ms: number
-  errors_last_24h: number
-  secrets: Record<string, boolean>
-  integrations: Array<{
-    provider: string
-    status: string
-    masked_preview: string | null
-    last_validated_at?: string | null
-    validation_error?: string | null
-  }>
-}
-
 export type Database = {
   public: {
     Tables: {

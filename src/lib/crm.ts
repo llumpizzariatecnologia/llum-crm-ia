@@ -1,7 +1,6 @@
 import 'server-only'
 
 import { randomUUID } from 'node:crypto'
-import { subHours } from 'date-fns'
 import { decrypt, encrypt, maskCredential } from '@/lib/encryption'
 import {
   CRM_CONFIG_PROVIDER,
@@ -24,7 +23,6 @@ import type {
   CrmSettings,
   Customer,
   DashboardStats,
-  DiagnosticsSnapshot,
   Handoff,
   HandoffWithRelations,
   Integration,
@@ -1872,78 +1870,5 @@ export async function listLogs() {
     webhooks: (webhooksRes.data || []) as WebhookEvent[],
     interactions: (interactionsRes.data || []) as Interaction[],
     sends: sendsRes.data || [],
-  }
-}
-
-export async function getDiagnostics(): Promise<DiagnosticsSnapshot> {
-  const supabase = getServerSupabaseClient()
-  const [
-    webhookRes,
-    customerRes,
-    conversationRes,
-    inboundRes,
-    outboundRes,
-    aiRunRes,
-    leadRes,
-    handoffRes,
-    errorRes,
-    avgLatencyRes,
-    errorsCountRes,
-    integrations,
-  ] = await Promise.all([
-    supabase.from('webhook_events').select('*').order('created_at', { ascending: false }).limit(1).maybeSingle(),
-    supabase.from('customers').select('*').order('updated_at', { ascending: false }).limit(1).maybeSingle(),
-    supabase.from('conversations').select('*').order('updated_at', { ascending: false }).limit(1).maybeSingle(),
-    supabase.from('interactions').select('*').eq('direction', 'inbound').order('created_at', { ascending: false }).limit(1).maybeSingle(),
-    supabase.from('interactions').select('*').eq('direction', 'outbound').order('created_at', { ascending: false }).limit(1).maybeSingle(),
-    supabase.from('agent_runs').select('*').order('created_at', { ascending: false }).limit(1).maybeSingle(),
-    supabase.from('leads').select('*').order('updated_at', { ascending: false }).limit(1).maybeSingle(),
-    supabase.from('handoffs').select('*').order('requested_at', { ascending: false }).limit(1).maybeSingle(),
-    supabase.from('agent_runs').select('*').eq('status', 'error').order('created_at', { ascending: false }).limit(1).maybeSingle(),
-    supabase.from('agent_runs').select('latency_ms').eq('status', 'success').not('latency_ms', 'is', null),
-    supabase.from('agent_runs').select('*', { count: 'exact', head: true }).gte('created_at', subHours(new Date(), 24).toISOString()).eq('status', 'error'),
-    listIntegrations(),
-  ])
-
-  const latencies = (avgLatencyRes.data || []) as Array<{ latency_ms: number | null }>
-  const avgLatency = latencies.length
-    ? Math.round(
-        latencies.reduce((acc, item) => acc + (item.latency_ms || 0), 0) / latencies.length
-      )
-    : 0
-
-  return {
-    last_webhook: (webhookRes.data as WebhookEvent | null) || null,
-    last_customer: (customerRes.data as Customer | null) || null,
-    last_conversation: (conversationRes.data as Conversation | null) || null,
-    last_inbound: (inboundRes.data as Interaction | null) || null,
-    last_outbound: (outboundRes.data as Interaction | null) || null,
-    last_ai_run: (aiRunRes.data as AgentRun | null) || null,
-    last_lead: (leadRes.data as Lead | null) || null,
-    last_handoff: (handoffRes.data as Handoff | null) || null,
-    last_error: (errorRes.data as AgentRun | null) || null,
-    avg_response_time_ms: avgLatency,
-    errors_last_24h: errorsCountRes.count || 0,
-    secrets: {
-      NEXT_PUBLIC_SUPABASE_URL: Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL),
-      NEXT_PUBLIC_SUPABASE_ANON_KEY: Boolean(process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY),
-      SUPABASE_SERVICE_ROLE_KEY: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
-      OPENAI_API_KEY: Boolean(process.env.OPENAI_API_KEY),
-      META_ACCESS_TOKEN: Boolean(process.env.META_ACCESS_TOKEN),
-      META_PHONE_NUMBER_ID: Boolean(process.env.META_PHONE_NUMBER_ID),
-      META_APP_SECRET: Boolean(process.env.META_APP_SECRET),
-      META_VERIFY_TOKEN: Boolean(process.env.META_VERIFY_TOKEN),
-      ENCRYPTION_KEY: Boolean(process.env.ENCRYPTION_KEY),
-      CRM_ADMIN_EMAIL: Boolean(process.env.CRM_ADMIN_EMAIL),
-      CRM_ADMIN_PASSWORD: Boolean(process.env.CRM_ADMIN_PASSWORD),
-      CRM_SESSION_SECRET: Boolean(process.env.CRM_SESSION_SECRET),
-    },
-    integrations: integrations.map((item) => ({
-      provider: item.provider,
-      status: item.status,
-      masked_preview: item.masked_preview || null,
-      last_validated_at: item.last_validated_at || null,
-      validation_error: item.validation_error || null,
-    })),
   }
 }

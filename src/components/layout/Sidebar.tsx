@@ -3,7 +3,6 @@
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
 import {
-  Activity,
   BookOpen,
   BrainCircuit,
   FileText,
@@ -21,14 +20,13 @@ import { cn } from '@/lib/utils'
 
 const navSections = [
   {
-    label: 'Operação',
+    label: 'Operacao',
     items: [
       { href: '/', label: 'Dashboard', icon: LayoutDashboard },
       { href: '/inbox', label: 'Inbox', icon: MessageSquare },
       { href: '/leads', label: 'Leads', icon: UserPlus },
       { href: '/handoffs', label: 'Handoffs', icon: Headphones },
       { href: '/logs', label: 'Logs', icon: FileText },
-      { href: '/diagnostics', label: 'Diagnóstico', icon: Activity },
     ],
   },
   {
@@ -48,8 +46,8 @@ const navSections = [
   {
     label: 'Plataforma',
     items: [
-      { href: '/integrations', label: 'Integrações', icon: KeyRound },
-      { href: '/settings', label: 'Configurações Gerais', icon: Settings },
+      { href: '/integrations', label: 'Integracoes', icon: KeyRound },
+      { href: '/settings', label: 'Configuracoes Gerais', icon: Settings },
     ],
   },
 ]
@@ -73,7 +71,7 @@ export function Sidebar() {
           </div>
           <div>
             <p className="text-sm font-medium text-[#0d253d]">LLUM CRM IA</p>
-            <p className="text-xs text-[#64748d]">WhatsApp, IA e operação auditável</p>
+            <p className="text-xs text-[#64748d]">WhatsApp, IA e operacao auditavel</p>
           </div>
         </div>
       </div>
@@ -111,9 +109,7 @@ export function Sidebar() {
                         )}
                       />
                       <span>{item.label}</span>
-                      {isActive ? (
-                        <span className="ml-auto h-2 w-2 rounded-full bg-[#533afd]" />
-                      ) : null}
+                      {isActive ? <span className="ml-auto h-2 w-2 rounded-full bg-[#533afd]" /> : null}
                     </Link>
                   )
                 })}

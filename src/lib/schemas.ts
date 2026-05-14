@@ -19,13 +19,6 @@ export const conversationStatusSchema = z.object({
   status: z.enum(['ai_active', 'human_active', 'handoff_requested', 'closed']),
 })
 
-export const simulateInboundSchema = z.object({
-  customerName: z.string().trim().min(2).max(80),
-  phone: z.string().trim().min(8).max(20),
-  body: z.string().trim().min(1).max(2000),
-  externalMessageId: z.string().trim().min(3).max(120).optional(),
-})
-
 export const crmSettingsSchema = z.object({
   assistantName: z.string().trim().min(2).max(60),
   tone: z.string().trim().min(4).max(200),
