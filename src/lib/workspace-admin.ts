@@ -321,6 +321,36 @@ export async function saveKnowledgeDocument(
   return data as KnowledgeDocument
 }
 
+export async function deleteKnowledgeDocument(documentId: string, workspaceId?: string) {
+  const supabase = getServerSupabaseClient()
+  const workspace = getWorkspaceId(workspaceId)
+
+  const { data: existing, error: existingError } = await supabase
+    .from('knowledge_documents')
+    .select('id')
+    .eq('id', documentId)
+    .eq('workspace_id', workspace)
+    .maybeSingle()
+
+  if (existingError) throw new Error(existingError.message)
+  if (!existing) throw new Error('Documento nao encontrado')
+
+  const { error: chunkDeleteError } = await supabase
+    .from('knowledge_chunks')
+    .delete()
+    .eq('document_id', documentId)
+
+  if (chunkDeleteError) throw new Error(chunkDeleteError.message)
+
+  const { error: documentDeleteError } = await supabase
+    .from('knowledge_documents')
+    .delete()
+    .eq('id', documentId)
+    .eq('workspace_id', workspace)
+
+  if (documentDeleteError) throw new Error(documentDeleteError.message)
+}
+
 export async function getWhatsappChannelConfig(workspaceId?: string) {
   const supabase = getServerSupabaseClient()
   const { data, error } = await supabase

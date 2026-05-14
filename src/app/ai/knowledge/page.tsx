@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { BookOpen, FileUp, Loader2, Save, Sparkles } from 'lucide-react'
+import { BookOpen, FileUp, Loader2, PencilLine, Plus, Save, Sparkles, Trash2 } from 'lucide-react'
 import { fetchJson } from '@/lib/client'
 
 type KnowledgeDocument = {
@@ -49,6 +49,7 @@ export default function KnowledgePage() {
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null)
 
   useEffect(() => {
     let active = true
@@ -57,6 +58,7 @@ export default function KnowledgePage() {
         const data = await fetchJson<{ documents: KnowledgeDocument[] }>('/api/knowledge')
         if (!active) return
         setDocuments(data.documents)
+        setSelectedDocumentId(data.documents[0]?.id || null)
       } catch (err) {
         if (active) setError((err as Error).message)
       } finally {
@@ -87,6 +89,7 @@ export default function KnowledgePage() {
       setForm(data.document)
       setTagInput((data.document.tags || []).join(', '))
       setImportResult(data.indexing || null)
+      setSelectedDocumentId(data.document.id || null)
       setMessage(
         data.indexing
           ? `Documento salvo e indexado em ${data.indexing.chunkCount} chunks.`
@@ -141,6 +144,7 @@ export default function KnowledgePage() {
       setImportResult(data.indexing)
       setImportFile(null)
       setImportTitle('')
+      setSelectedDocumentId(data.document.id || null)
       setMessage(
         `PDF importado com sucesso: ${data.indexing.chunkCount} chunks e ${data.indexing.embeddedCount} embeddings gerados.`
       )
@@ -148,6 +152,58 @@ export default function KnowledgePage() {
       setError((err as Error).message)
     } finally {
       setImporting(false)
+    }
+  }
+
+  function startNewDocument() {
+    setForm(emptyDocument)
+    setTagInput('')
+    setSelectedDocumentId(null)
+    setMessage(null)
+    setError(null)
+  }
+
+  function selectDocument(document: KnowledgeDocument) {
+    setForm(document)
+    setTagInput((document.tags || []).join(', '))
+    setSelectedDocumentId(document.id || null)
+    setMessage(null)
+    setError(null)
+  }
+
+  async function deleteDocument(document: KnowledgeDocument) {
+    if (!document.id) return
+    const confirmed = window.confirm(`Excluir "${document.title}" da base de conhecimento?`)
+    if (!confirmed) return
+
+    setError(null)
+    setMessage(null)
+
+    try {
+      const data = await fetchJson<{ documents: KnowledgeDocument[] }>(
+        `/api/knowledge?id=${document.id}`,
+        { method: 'DELETE' }
+      )
+
+      setDocuments(data.documents)
+
+      const nextSelected =
+        selectedDocumentId === document.id ? (data.documents[0] ?? null) : data.documents.find((item) => item.id === selectedDocumentId) ?? data.documents[0] ?? null
+
+      if (nextSelected) {
+        setForm(nextSelected)
+        setTagInput((nextSelected.tags || []).join(', '))
+        setSelectedDocumentId(nextSelected.id || null)
+      } else {
+        setForm(emptyDocument)
+        setTagInput('')
+        setSelectedDocumentId(null)
+      }
+
+      setImportResult(null)
+      setMessage('Documento removido da base de conhecimento.')
+    } catch (err) {
+      setError((err as Error).message)
     }
   }
 
@@ -287,6 +343,14 @@ export default function KnowledgePage() {
               </div>
             </div>
 
+            <button
+              onClick={startNewDocument}
+              className="mt-4 inline-flex h-11 items-center justify-center gap-2 rounded-full border border-[#d5deea] px-4 text-sm font-medium text-[#533afd] transition hover:bg-[#f8fbff]"
+            >
+              <Plus className="h-4 w-4" />
+              Novo documento
+            </button>
+
             <div className="mt-4 space-y-3">
               {importResult ? (
                 <div className="rounded-2xl border border-[#dce4ef] bg-[#f8fbff] px-4 py-3 text-sm text-[#425466]">
@@ -301,10 +365,42 @@ export default function KnowledgePage() {
 
               {documents.length === 0 ? <p className="text-sm text-[#7a8ca2]">A base ainda esta vazia.</p> : null}
               {documents.map((document) => (
-                <button key={document.id || document.title} onClick={() => { setForm(document); setTagInput((document.tags || []).join(', ')) }} className="w-full rounded-2xl border border-[#e6edf5] bg-[#f8fbff] px-4 py-3 text-left">
-                  <p className="text-sm font-medium text-[#0d253d]">{document.title}</p>
-                  <p className="mt-1 text-xs text-[#64748d]">{document.category} - {document.status}{document.version ? ` - v${document.version}` : ''}</p>
-                </button>
+                <div
+                  key={document.id || document.title}
+                  className={`rounded-2xl border px-4 py-3 transition ${
+                    selectedDocumentId === document.id
+                      ? 'border-[#533afd] bg-[#eef2ff]'
+                      : 'border-[#e6edf5] bg-[#f8fbff]'
+                  }`}
+                >
+                  <button
+                    onClick={() => selectDocument(document)}
+                    className="w-full text-left"
+                  >
+                    <p className="text-sm font-medium text-[#0d253d]">{document.title}</p>
+                    <p className="mt-1 text-xs text-[#64748d]">
+                      {document.category} - {document.status}
+                      {document.version ? ` - v${document.version}` : ''}
+                    </p>
+                  </button>
+
+                  <div className="mt-3 flex gap-2">
+                    <button
+                      onClick={() => selectDocument(document)}
+                      className="inline-flex h-9 items-center justify-center gap-2 rounded-full border border-[#d5deea] px-3 text-xs font-medium text-[#425466] transition hover:bg-white"
+                    >
+                      <PencilLine className="h-3.5 w-3.5" />
+                      Editar
+                    </button>
+                    <button
+                      onClick={() => void deleteDocument(document)}
+                      className="inline-flex h-9 items-center justify-center gap-2 rounded-full border border-[#f0c7d7] px-3 text-xs font-medium text-[#c7245d] transition hover:bg-white"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Excluir
+                    </button>
+                  </div>
+                </div>
               ))}
             </div>
           </div>

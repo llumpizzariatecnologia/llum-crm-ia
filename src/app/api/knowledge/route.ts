@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiSession } from '@/lib/route-guards'
 import { knowledgeDocumentSchema } from '@/lib/schemas'
-import { listKnowledgeDocuments, saveKnowledgeDocument } from '@/lib/workspace-admin'
+import {
+  deleteKnowledgeDocument,
+  listKnowledgeDocuments,
+  saveKnowledgeDocument,
+} from '@/lib/workspace-admin'
 import { indexKnowledgeDocument } from '@/lib/knowledge-rag'
 
 export const dynamic = 'force-dynamic'
@@ -27,4 +31,18 @@ export async function POST(request: NextRequest) {
   const indexing = await indexKnowledgeDocument({ document })
   const documents = await listKnowledgeDocuments()
   return NextResponse.json({ ok: true, document, documents, indexing })
+}
+
+export async function DELETE(request: NextRequest) {
+  const auth = await requireApiSession()
+  if (!auth.ok) return auth.response
+
+  const documentId = request.nextUrl.searchParams.get('id')?.trim()
+  if (!documentId) {
+    return NextResponse.json({ error: 'Documento nao informado' }, { status: 400 })
+  }
+
+  await deleteKnowledgeDocument(documentId)
+  const documents = await listKnowledgeDocuments()
+  return NextResponse.json({ ok: true, documents })
 }
