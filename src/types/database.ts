@@ -208,6 +208,9 @@ export interface WhatsappChannelConfig {
   graph_api_version: string
   verified_name: string | null
   quality_rating: string | null
+  split_long_messages: boolean
+  max_message_chars: number
+  split_message_delay_seconds: number
   status: 'draft' | 'connected' | 'attention' | 'disconnected'
   connected_at: string | null
   last_healthcheck_at: string | null

@@ -65,6 +65,9 @@ export const whatsappChannelConfigSchema = z.object({
   graphApiVersion: z.string().trim().min(2).max(20),
   verifiedName: z.string().trim().max(120).optional().default(''),
   qualityRating: z.string().trim().max(40).optional().default(''),
+  splitLongMessages: z.boolean().default(true),
+  maxMessageChars: z.coerce.number().int().min(120).max(1200).default(300),
+  splitMessageDelaySeconds: z.coerce.number().int().min(0).max(30).default(1),
   status: z.enum(['draft', 'connected', 'attention', 'disconnected']),
 })
 

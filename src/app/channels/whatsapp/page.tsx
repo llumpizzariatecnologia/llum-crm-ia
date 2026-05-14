@@ -13,6 +13,9 @@ type ChannelConfig = {
   graphApiVersion: string
   verifiedName: string
   qualityRating: string
+  splitLongMessages: boolean
+  maxMessageChars: number
+  splitMessageDelaySeconds: number
   status: 'draft' | 'connected' | 'attention' | 'disconnected'
 }
 
@@ -31,6 +34,9 @@ const emptyConfig: ChannelConfig = {
   graphApiVersion: 'v20.0',
   verifiedName: '',
   qualityRating: '',
+  splitLongMessages: true,
+  maxMessageChars: 300,
+  splitMessageDelaySeconds: 1,
   status: 'draft',
 }
 
@@ -152,6 +158,80 @@ export default function WhatsappPage() {
           <div className="mt-4">
             <label className="mb-1.5 block text-xs font-medium text-[#425466]">Quality rating</label>
             <input value={config.qualityRating} onChange={(event) => setConfig({ ...config, qualityRating: event.target.value })} className="h-11 w-full rounded-2xl border border-[#cad6e4] bg-white px-4 text-sm text-[#0d253d] outline-none transition focus:border-[#533afd]" />
+          </div>
+
+          <div className="mt-6 rounded-[26px] border border-[#e6edf5] bg-[#f8fbff] p-5">
+            <div className="flex items-start gap-3">
+              <input
+                id="splitLongMessages"
+                type="checkbox"
+                checked={config.splitLongMessages}
+                onChange={(event) =>
+                  setConfig({ ...config, splitLongMessages: event.target.checked })
+                }
+                className="mt-1 h-4 w-4 rounded border border-[#cad6e4] accent-[#533afd]"
+              />
+              <div>
+                <label
+                  htmlFor="splitLongMessages"
+                  className="text-sm font-medium text-[#0d253d]"
+                >
+                  Dividir mensagens longas
+                </label>
+                <p className="mt-1 text-sm leading-6 text-[#64748d]">
+                  Divide automaticamente respostas grandes em partes menores para o
+                  WhatsApp ficar mais natural.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-[#425466]">
+                  Tamanho maximo por mensagem
+                </label>
+                <input
+                  type="number"
+                  min={120}
+                  max={1200}
+                  value={config.maxMessageChars}
+                  onChange={(event) =>
+                    setConfig({
+                      ...config,
+                      maxMessageChars: Number(event.target.value) || 300,
+                    })
+                  }
+                  disabled={!config.splitLongMessages}
+                  className="h-11 w-full rounded-2xl border border-[#cad6e4] bg-white px-4 text-sm text-[#0d253d] outline-none transition focus:border-[#533afd] disabled:opacity-60"
+                />
+                <p className="mt-1 text-xs leading-5 text-[#7a8ca2]">
+                  Recomendado: 300 caracteres.
+                </p>
+              </div>
+
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-[#425466]">
+                  Tempo entre blocos
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  max={30}
+                  value={config.splitMessageDelaySeconds}
+                  onChange={(event) =>
+                    setConfig({
+                      ...config,
+                      splitMessageDelaySeconds: Number(event.target.value) || 0,
+                    })
+                  }
+                  disabled={!config.splitLongMessages}
+                  className="h-11 w-full rounded-2xl border border-[#cad6e4] bg-white px-4 text-sm text-[#0d253d] outline-none transition focus:border-[#533afd] disabled:opacity-60"
+                />
+                <p className="mt-1 text-xs leading-5 text-[#7a8ca2]">
+                  Intervalo em segundos entre uma parte e outra.
+                </p>
+              </div>
+            </div>
           </div>
 
           <button onClick={save} disabled={saving} className="mt-5 inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#533afd] px-5 text-sm font-medium text-white transition hover:bg-[#4434d4] disabled:opacity-60">

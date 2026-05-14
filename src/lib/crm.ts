@@ -31,6 +31,7 @@ import type {
   Lead,
   LeadWithRelations,
   WebhookEvent,
+  WhatsappChannelConfig,
 } from '@/types/database'
 
 type ClassifiedIntent =
@@ -117,6 +118,7 @@ type ResolvedWhatsAppRuntime = {
   wabaId: string | null
   appSecret: string | null
   verifyToken: string | null
+  channelConfig: WhatsappChannelConfig | null
   source: 'integration' | 'environment' | 'mixed' | 'none'
 }
 
@@ -200,6 +202,78 @@ function formatAgentReplyBlocks(value: string) {
   }
 
   return blocks.join('\n\n')
+}
+
+function splitLongWhatsAppMessage(body: string, maxChars: number) {
+  const normalized = body.replace(/\r/g, '').trim()
+  if (!normalized || normalized.length <= maxChars) return [normalized]
+
+  const paragraphs = normalized
+    .split(/\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+
+  const chunks: string[] = []
+  let current = ''
+
+  const flush = () => {
+    if (current.trim()) {
+      chunks.push(current.trim())
+      current = ''
+    }
+  }
+
+  const fitSegment = (segment: string) => {
+    if (segment.length <= maxChars) return [segment]
+
+    const words = segment.split(/\s+/).filter(Boolean)
+    const fitted: string[] = []
+    let wordChunk = ''
+
+    for (const word of words) {
+      const nextWordChunk = wordChunk ? `${wordChunk} ${word}` : word
+      if (nextWordChunk.length <= maxChars) {
+        wordChunk = nextWordChunk
+        continue
+      }
+
+      if (wordChunk) fitted.push(wordChunk.trim())
+      wordChunk = word
+    }
+
+    if (wordChunk.trim()) fitted.push(wordChunk.trim())
+    return fitted
+  }
+
+  for (const paragraph of paragraphs) {
+    const segments =
+      paragraph.match(/[^,.;!?]+(?:[,.;!?]+|$)/g)?.map((item) => item.trim()).filter(Boolean) || [
+        paragraph,
+      ]
+
+    for (const segment of segments) {
+      const fittedSegments = fitSegment(segment)
+      for (const fitted of fittedSegments) {
+        const next = current ? `${current} ${fitted}` : fitted
+        if (next.length <= maxChars) {
+          current = next
+          continue
+        }
+
+        flush()
+        current = fitted
+      }
+    }
+
+    flush()
+  }
+
+  flush()
+  return chunks.filter(Boolean)
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 async function getKnowledgeMatches(message: string, workspaceId?: string): Promise<KnowledgeMatch[]> {
@@ -606,6 +680,7 @@ export async function resolveWhatsAppRuntime(
     wabaId,
     appSecret,
     verifyToken,
+    channelConfig,
     source,
   }
 }
@@ -1386,61 +1461,101 @@ async function sendWhatsAppMessage(params: {
 }) {
   const supabase = getServerSupabaseClient()
   const runtime = await resolveWhatsAppRuntime(params.workspaceId)
+  const splitLongMessages = runtime.channelConfig?.split_long_messages ?? true
+  const maxMessageChars = runtime.channelConfig?.max_message_chars ?? 300
+  const splitMessageDelaySeconds = runtime.channelConfig?.split_message_delay_seconds ?? 1
+  const chunks = splitLongMessages
+    ? splitLongWhatsAppMessage(params.body, maxMessageChars)
+    : [params.body]
+
   let providerMessageId = `simulated-${randomUUID()}`
   let sendStatus = 'simulated'
-  let responsePayload: WhatsAppSendApiResponse = { mode: 'simulated' }
+  let responsePayload: WhatsAppSendApiResponse = { mode: 'simulated', chunk_count: chunks.length }
   let error: string | null = null
 
-  if (runtime.accessToken && runtime.phoneNumberId) {
-    try {
-      const response = await fetch(
-        `https://graph.facebook.com/v20.0/${runtime.phoneNumberId}/messages`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${runtime.accessToken}`,
-          },
-          body: JSON.stringify({
-            messaging_product: 'whatsapp',
-            to: params.customer.phone.replace(/^\+/, ''),
-            type: 'text',
-            text: { body: params.body },
-          }),
-        }
-      )
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index]
+    let chunkProviderMessageId = `simulated-${randomUUID()}`
+    let chunkSendStatus = 'simulated'
+    let chunkResponsePayload: WhatsAppSendApiResponse = {
+      mode: 'simulated',
+      chunk_index: index,
+      chunk_count: chunks.length,
+    }
+    let chunkError: string | null = null
 
-      responsePayload = (await response.json().catch(() => ({}))) as WhatsAppSendApiResponse
-      if (response.ok) {
-        providerMessageId = responsePayload.messages?.[0]?.id || providerMessageId
-        sendStatus = 'sent'
-      } else {
-        sendStatus = 'failed'
-        error = (responsePayload as { error?: { message?: string } }).error?.message || 'Falha no envio'
+    if (runtime.accessToken && runtime.phoneNumberId) {
+      try {
+        const response = await fetch(
+          `https://graph.facebook.com/v20.0/${runtime.phoneNumberId}/messages`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${runtime.accessToken}`,
+            },
+            body: JSON.stringify({
+              messaging_product: 'whatsapp',
+              to: params.customer.phone.replace(/^\+/, ''),
+              type: 'text',
+              text: { body: chunk },
+            }),
+          }
+        )
+
+        chunkResponsePayload = (await response.json().catch(() => ({}))) as WhatsAppSendApiResponse
+        if (response.ok) {
+          chunkProviderMessageId =
+            chunkResponsePayload.messages?.[0]?.id || chunkProviderMessageId
+          chunkSendStatus = 'sent'
+        } else {
+          chunkSendStatus = 'failed'
+          chunkError =
+            (chunkResponsePayload as { error?: { message?: string } }).error?.message ||
+            'Falha no envio'
+        }
+      } catch (sendError) {
+        chunkSendStatus = 'failed'
+        chunkError = (sendError as Error).message
+        chunkResponsePayload = { mode: 'real_failed', chunk_index: index, chunk_count: chunks.length }
       }
-    } catch (sendError) {
-      sendStatus = 'failed'
-      error = (sendError as Error).message
-      responsePayload = { mode: 'real_failed' }
+    }
+
+    await supabase.from('whatsapp_sends').insert({
+      conversation_id: params.conversation.id,
+      interaction_id: params.interactionId,
+      customer_id: params.customer.id,
+      to_phone: params.customer.phone,
+      message_body: chunk,
+      provider_message_id: chunkProviderMessageId,
+      status: chunkSendStatus,
+      error: chunkError,
+      payload: {
+        body: chunk,
+        chunk_index: index,
+        chunk_count: chunks.length,
+        split_long_messages: splitLongMessages,
+        max_message_chars: maxMessageChars,
+        split_message_delay_seconds: splitMessageDelaySeconds,
+        phone_number_id: runtime.phoneNumberId,
+        config_source: runtime.source,
+      },
+      response: chunkResponsePayload,
+    } as never)
+
+    providerMessageId = chunkProviderMessageId
+    sendStatus = chunkSendStatus
+    responsePayload = chunkResponsePayload
+    error = chunkError
+
+    if (chunkSendStatus === 'failed') {
+      break
+    }
+
+    if (index < chunks.length - 1 && splitMessageDelaySeconds > 0) {
+      await wait(splitMessageDelaySeconds * 1000)
     }
   }
-
-  await supabase.from('whatsapp_sends').insert({
-    conversation_id: params.conversation.id,
-    interaction_id: params.interactionId,
-    customer_id: params.customer.id,
-    to_phone: params.customer.phone,
-    message_body: params.body,
-    provider_message_id: providerMessageId,
-    status: sendStatus,
-    error,
-    payload: {
-      body: params.body,
-      phone_number_id: runtime.phoneNumberId,
-      config_source: runtime.source,
-    },
-    response: responsePayload,
-  } as never)
 
   return {
     providerMessageId,

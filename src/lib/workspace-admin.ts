@@ -46,6 +46,9 @@ export const defaultWhatsappChannelInput = {
   graphApiVersion: 'v20.0',
   verifiedName: '',
   qualityRating: '',
+  splitLongMessages: true,
+  maxMessageChars: 300,
+  splitMessageDelaySeconds: 1,
   status: 'draft' as const,
 }
 
@@ -75,6 +78,9 @@ type WhatsappChannelConfigInput = {
   graphApiVersion: string
   verifiedName: string
   qualityRating: string
+  splitLongMessages: boolean
+  maxMessageChars: number
+  splitMessageDelaySeconds: number
   status: WhatsappChannelConfig['status']
 }
 
@@ -381,6 +387,9 @@ export async function saveWhatsappChannelConfig(
     graph_api_version: input.graphApiVersion,
     verified_name: input.verifiedName || null,
     quality_rating: input.qualityRating || null,
+    split_long_messages: input.splitLongMessages,
+    max_message_chars: input.maxMessageChars,
+    split_message_delay_seconds: input.splitMessageDelaySeconds,
     status: input.status,
     connected_at: input.status === 'connected' ? nowIso() : null,
     last_healthcheck_at: nowIso(),
