@@ -1325,7 +1325,7 @@ async function updateConversation(conversationId: string, updates: Partial<Conve
 
 async function syncOpenHandoffForConversation(
   conversationId: string,
-  action: 'claim' | 'resolve'
+  action: 'claim' | 'resolve' | 'release_to_ai'
 ) {
   const supabase = getServerSupabaseClient()
   const { data: openHandoff } = (await supabase
@@ -1345,10 +1345,20 @@ async function syncOpenHandoffForConversation(
           status: 'in_progress',
           metadata: { ...(openHandoff.metadata || {}), claimed_by: 'Operador', claimed_at: nowIso() },
         }
-      : {
+      : action === 'resolve'
+        ? {
+            status: 'resolved',
+            resolved_at: nowIso(),
+            resolved_by: 'Operador',
+          }
+        : {
           status: 'resolved',
           resolved_at: nowIso(),
-          resolved_by: 'Operador',
+          resolved_by: 'CRM IA',
+          metadata: {
+            ...(openHandoff.metadata || {}),
+            released_to_ai_at: nowIso(),
+          },
         }
 
   const { data } = await supabase
@@ -1669,11 +1679,7 @@ export async function processInboundMessage(input: {
     })
   }
 
-  if (
-    classification.shouldHandoff ||
-    conversation.status === 'human_active' ||
-    conversation.status === 'handoff_requested'
-  ) {
+  if (classification.shouldHandoff || conversation.status === 'human_active') {
     handoff = await createOrUpdateHandoff({
       customerId: customer.id,
       conversationId: conversation.id,
@@ -1755,6 +1761,10 @@ export async function processInboundMessage(input: {
   }
 
   if (settings.aiEnabled) {
+    if (conversation.status === 'handoff_requested') {
+      await syncOpenHandoffForConversation(conversation.id, 'release_to_ai')
+    }
+
     const formattedReply = formatAgentReplyBlocks(classification.reply)
 
     const outbound = await createOutboundInteraction({
