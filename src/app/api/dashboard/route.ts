@@ -8,6 +8,14 @@ export async function GET() {
   const auth = await requireApiSession()
   if (!auth.ok) return auth.response
 
-  const data = await fetchDashboardData()
-  return NextResponse.json(data)
+  try {
+    const data = await fetchDashboardData()
+    return NextResponse.json(data)
+  } catch (error) {
+    console.error('dashboard_route_error', error)
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : 'Falha ao carregar dashboard' },
+      { status: 500 }
+    )
+  }
 }

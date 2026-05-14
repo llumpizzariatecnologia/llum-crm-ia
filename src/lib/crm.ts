@@ -1610,6 +1610,17 @@ export async function fetchDashboardData() {
     supabase.from('agent_runs').select('latency_ms').not('latency_ms', 'is', null),
   ])
 
+  const firstError =
+    conversationsRes.error ||
+    runsRes.error ||
+    handoffRes.error ||
+    leadsRes.error ||
+    latenciesRes.error
+
+  if (firstError) {
+    throw new Error(firstError.message)
+  }
+
   const conversations = (conversationsRes.data || []) as ConversationWithCustomer[]
   const runs = (runsRes.data || []) as AgentRun[]
   const leads = (leadsRes.data || []) as Lead[]
