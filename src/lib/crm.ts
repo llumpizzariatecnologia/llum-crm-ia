@@ -155,6 +155,13 @@ function clipText(value: string, maxLength = 240) {
   return `${value.slice(0, maxLength - 3).trim()}...`
 }
 
+function isShortAffirmationMessage(value: string) {
+  const normalized = normalizeText(value).trim()
+  return /^(sim|s|isso|ok|okay|certo|claro|com certeza|pode|pode sim|pode ser|fechado|confirmo|confirmar|quero sim|isso mesmo)$/.test(
+    normalized
+  )
+}
+
 function formatAgentReplyBlocks(value: string) {
   const normalized = value
     .replace(/\r/g, '')
@@ -163,36 +170,35 @@ function formatAgentReplyBlocks(value: string) {
     .trim()
 
   if (!normalized) return value
-  if (normalized.includes('\n\n')) {
-    return normalized
-      .split(/\n{2,}/)
-      .map((block) => block.trim())
-      .filter(Boolean)
-      .join('\n\n')
-  }
-
-  const sentences = normalized.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map((item) => item.trim()) || [
-    normalized,
-  ]
-
   const blocks: string[] = []
-  let current = ''
+  const paragraphs = normalized.includes('\n\n')
+    ? normalized
+        .split(/\n{2,}/)
+        .map((block) => block.trim())
+        .filter(Boolean)
+    : [normalized]
 
-  for (const sentence of sentences) {
-    const next = current ? `${current} ${sentence}` : sentence
-    const shouldBreak =
-      current.length > 0 && (next.length > 180 || current.split(/[.!?]+/).filter(Boolean).length >= 2)
+  for (const paragraph of paragraphs) {
+    const parts =
+      paragraph.match(/[^,.;!?]+(?:[,.;!?]+|$)/g)?.map((item) => item.trim()).filter(Boolean) || [
+        paragraph,
+      ]
 
-    if (shouldBreak) {
-      blocks.push(current.trim())
-      current = sentence
-      continue
+    let current = ''
+    for (const part of parts) {
+      const next = current ? `${current} ${part}` : part
+      if (current.length > 0 && next.length > 160) {
+        blocks.push(current.trim())
+        current = part
+        continue
+      }
+
+      current = next
     }
 
-    current = next
+    if (current.trim()) blocks.push(current.trim())
   }
 
-  if (current.trim()) blocks.push(current.trim())
   return blocks.join('\n\n')
 }
 
@@ -850,6 +856,10 @@ function classifyHeuristically(
   conversationHistory: ConversationContextTurn[] = []
 ): Omit<ClassificationResult, 'knowledgeDocumentIds' | 'modelUsed'> {
   const text = buildHeuristicSignalText(message, conversationHistory)
+  const previousTurns = conversationHistory.slice(0, -1)
+  const lastAssistantTurn = [...previousTurns]
+    .reverse()
+    .find((turn) => turn.senderType === 'ai' || turn.senderType === 'human')
   const hasVisitSignal = /(hoje|amanh[ãa]|mesa|ir|visitar|reservar|reserva|anivers)/.test(text)
   const wantsHuman =
     /(atendente|humano|respons[áa]vel|ajuda humana|falar com (alguem|algu[eé]m|uma pessoa|um atendente)|quero falar com|prefiro falar com)/.test(
@@ -865,6 +875,15 @@ function classifyHeuristically(
   const location = /(onde fica|endereço|endereco|localização|localizacao)/.test(text)
   const greeting = /^(oi|ol[aá]|bom dia|boa tarde|boa noite|opa)\b/.test(text)
 
+  const contextualReservationAcceptance =
+    isShortAffirmationMessage(message) &&
+    Boolean(
+      lastAssistantTurn?.body &&
+        /(reserva|mesa|domingo|sabado|horario|19h|taxa|quantas pessoas|confirm)/.test(
+          normalizeText(lastAssistantTurn.body)
+        )
+    )
+
   if (wantsHuman || complaint) {
     return {
       intent: wantsHuman ? 'human_request' : 'complaint',
@@ -874,6 +893,20 @@ function classifyHeuristically(
       reply: settings.handoffMessage,
       routeReason: wantsHuman ? 'human_requested' : 'complaint_detected',
       leadSummary: wantsHuman ? 'Cliente pediu atendimento humano.' : 'Cliente registrou reclamação.',
+      source: 'heuristic',
+    }
+  }
+
+  if (contextualReservationAcceptance) {
+    return {
+      intent: 'reservation_interest',
+      confidence: 0.96,
+      shouldCreateLead: true,
+      shouldHandoff: true,
+      reply:
+        'Perfeito! Recebi seu ok 😊\n\nVou encaminhar sua reserva para a equipe finalizar com seguranca e te orientar direitinho sobre a taxa e os proximos passos por aqui.',
+      routeReason: 'reservation_affirmation_handoff',
+      leadSummary: 'Cliente confirmou prosseguir com a reserva.',
       source: 'heuristic',
     }
   }
@@ -1005,6 +1038,15 @@ async function classifyMessage(
   conversationHistory: ConversationContextTurn[],
   workspaceId?: string
 ) {
+  const heuristicResult = classifyHeuristically(message, settings, conversationHistory)
+  if (heuristicResult.routeReason === 'reservation_affirmation_handoff') {
+    return {
+      ...heuristicResult,
+      knowledgeDocumentIds: knowledgeMatches.map((item) => item.id),
+      modelUsed: 'heuristic-router',
+    }
+  }
+
   const openAiResult = await classifyWithConfiguredProvider(
     message,
     settings,
@@ -1014,7 +1056,6 @@ async function classifyMessage(
     workspaceId
   )
   if (openAiResult) return openAiResult
-  const heuristicResult = classifyHeuristically(message, settings, conversationHistory)
   return {
     ...heuristicResult,
     reply: buildKnowledgeAwareReply(heuristicResult.intent, knowledgeMatches) || heuristicResult.reply,
@@ -1542,10 +1583,14 @@ export async function processInboundMessage(input: {
       conversation.status !== 'handoff_requested'
 
     if (shouldSendHandoffReply) {
+      const formattedHandoffReply = formatAgentReplyBlocks(
+        classification.reply || settings.handoffMessage
+      )
+
       const outbound = await createOutboundInteraction({
         conversationId: conversation.id,
         customerId: customer.id,
-        body: settings.handoffMessage,
+        body: formattedHandoffReply,
         senderType: 'ai',
         metadata: {
           mode: 'handoff',
@@ -1557,7 +1602,7 @@ export async function processInboundMessage(input: {
         conversation,
         customer,
         interactionId: outbound.id,
-        body: outbound.body || settings.handoffMessage,
+        body: outbound.body || formattedHandoffReply,
         workspaceId,
       })
 
