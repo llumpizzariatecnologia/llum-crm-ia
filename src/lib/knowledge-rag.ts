@@ -1,5 +1,6 @@
 import 'server-only'
 
+import PDFParser from 'pdf2json'
 import { DEFAULT_WORKSPACE_ID } from '@/lib/constants'
 import { decrypt } from '@/lib/encryption'
 import { getServerSupabaseClient } from '@/lib/server/supabase'
@@ -313,14 +314,27 @@ export async function indexKnowledgeDocument(input: {
 }
 
 async function extractPdfText(buffer: Buffer) {
-  const { PDFParse } = await import('pdf-parse')
-  const parser = new PDFParse({ data: buffer })
-  try {
-    const result = await parser.getText()
-    return normalizeKnowledgeText(result.text || '')
-  } finally {
-    await parser.destroy()
-  }
+  const parser = new PDFParser(null, true)
+
+  const text = await new Promise<string>((resolve, reject) => {
+    parser.on('pdfParser_dataError', (error) => {
+      const parserError =
+        error instanceof Error
+          ? error
+          : error?.parserError || new Error('Falha ao extrair texto do PDF.')
+      reject(parserError)
+    })
+    parser.on('pdfParser_dataReady', () => {
+      try {
+        resolve(parser.getRawTextContent() || '')
+      } catch (error) {
+        reject(error)
+      }
+    })
+    parser.parseBuffer(buffer)
+  })
+
+  return normalizeKnowledgeText(text)
 }
 
 function buildImportedDocumentTitle(fileName: string) {
