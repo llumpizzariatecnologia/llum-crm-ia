@@ -1,6 +1,5 @@
 import 'server-only'
 
-import { PDFParse } from 'pdf-parse'
 import { DEFAULT_WORKSPACE_ID } from '@/lib/constants'
 import { decrypt } from '@/lib/encryption'
 import { getServerSupabaseClient } from '@/lib/server/supabase'
@@ -314,6 +313,7 @@ export async function indexKnowledgeDocument(input: {
 }
 
 async function extractPdfText(buffer: Buffer) {
+  const { PDFParse } = await import('pdf-parse')
   const parser = new PDFParse({ data: buffer })
   try {
     const result = await parser.getText()
