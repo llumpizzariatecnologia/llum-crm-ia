@@ -155,6 +155,47 @@ function clipText(value: string, maxLength = 240) {
   return `${value.slice(0, maxLength - 3).trim()}...`
 }
 
+function formatAgentReplyBlocks(value: string) {
+  const normalized = value
+    .replace(/\r/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim()
+
+  if (!normalized) return value
+  if (normalized.includes('\n\n')) {
+    return normalized
+      .split(/\n{2,}/)
+      .map((block) => block.trim())
+      .filter(Boolean)
+      .join('\n\n')
+  }
+
+  const sentences = normalized.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map((item) => item.trim()) || [
+    normalized,
+  ]
+
+  const blocks: string[] = []
+  let current = ''
+
+  for (const sentence of sentences) {
+    const next = current ? `${current} ${sentence}` : sentence
+    const shouldBreak =
+      current.length > 0 && (next.length > 180 || current.split(/[.!?]+/).filter(Boolean).length >= 2)
+
+    if (shouldBreak) {
+      blocks.push(current.trim())
+      current = sentence
+      continue
+    }
+
+    current = next
+  }
+
+  if (current.trim()) blocks.push(current.trim())
+  return blocks.join('\n\n')
+}
+
 async function getKnowledgeMatches(message: string, workspaceId?: string): Promise<KnowledgeMatch[]> {
   return searchKnowledgeMatches(message, workspaceId)
 }
@@ -1554,10 +1595,12 @@ export async function processInboundMessage(input: {
   }
 
   if (settings.aiEnabled) {
+    const formattedReply = formatAgentReplyBlocks(classification.reply)
+
     const outbound = await createOutboundInteraction({
       conversationId: conversation.id,
       customerId: customer.id,
-      body: classification.reply,
+      body: formattedReply,
       senderType: 'ai',
       metadata: {
         source: classification.source,
@@ -1569,7 +1612,7 @@ export async function processInboundMessage(input: {
       conversation,
       customer,
       interactionId: outbound.id,
-      body: classification.reply,
+      body: formattedReply,
       workspaceId,
     })
 
@@ -1577,7 +1620,7 @@ export async function processInboundMessage(input: {
       status: 'ai_active',
       current_intent: classification.intent,
       last_outbound_at: nowIso(),
-      last_message_preview: classification.reply,
+      last_message_preview: formattedReply,
       updated_at: nowIso(),
     })
 
