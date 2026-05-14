@@ -14,8 +14,8 @@ import { getServerSupabaseClient } from '@/lib/server/supabase'
 import {
   getPrimaryAgentProfile,
   getWhatsappChannelConfig,
-  listKnowledgeDocuments,
 } from '@/lib/workspace-admin'
+import { searchKnowledgeMatches, type KnowledgeMatch } from '@/lib/knowledge-rag'
 import type {
   AgentRun,
   AgentProfile,
@@ -30,7 +30,6 @@ import type {
   Integration,
   Interaction,
   Json,
-  KnowledgeDocument,
   Lead,
   LeadWithRelations,
   WebhookEvent,
@@ -63,15 +62,6 @@ type ClassificationResult = {
   knowledgeDocumentIds: string[]
   modelUsed?: string
   providerUsed?: string
-}
-
-type KnowledgeMatch = {
-  id: string
-  title: string
-  category: string
-  summary: string | null
-  excerpt: string
-  score: number
 }
 
 type ConversationContextTurn = {
@@ -162,50 +152,13 @@ function normalizeText(value: string) {
     .toLowerCase()
 }
 
-function tokenize(value: string) {
-  return normalizeText(value)
-    .split(/[^a-z0-9]+/)
-    .map((item) => item.trim())
-    .filter((item) => item.length >= 3)
-}
-
 function clipText(value: string, maxLength = 240) {
   if (value.length <= maxLength) return value
   return `${value.slice(0, maxLength - 3).trim()}...`
 }
 
-function buildKnowledgeExcerpt(document: KnowledgeDocument) {
-  return clipText((document.summary || document.content).replace(/\s+/g, ' '), 240)
-}
-
 async function getKnowledgeMatches(message: string, workspaceId?: string): Promise<KnowledgeMatch[]> {
-  const documents = await listKnowledgeDocuments(workspaceId)
-  const published = documents.filter((item) => item.status === 'published')
-  if (!published.length) return []
-
-  const messageTokens = tokenize(message)
-  return published
-    .map((document) => {
-      const haystackTokens = new Set([
-        ...tokenize(document.title),
-        ...tokenize(document.category),
-        ...document.tags.flatMap((tag) => tokenize(tag)),
-        ...tokenize(document.content),
-        ...tokenize(document.summary || ''),
-      ])
-
-      return {
-        id: document.id,
-        title: document.title,
-        category: document.category,
-        summary: document.summary,
-        excerpt: buildKnowledgeExcerpt(document),
-        score: messageTokens.reduce((acc, token) => acc + (haystackTokens.has(token) ? 1 : 0), 0),
-      }
-    })
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 3)
+  return searchKnowledgeMatches(message, workspaceId)
 }
 
 function buildKnowledgePrompt(matches: KnowledgeMatch[]) {

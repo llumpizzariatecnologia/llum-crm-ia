@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireApiSession } from '@/lib/route-guards'
 import { knowledgeDocumentSchema } from '@/lib/schemas'
 import { listKnowledgeDocuments, saveKnowledgeDocument } from '@/lib/workspace-admin'
+import { indexKnowledgeDocument } from '@/lib/knowledge-rag'
 
 export const dynamic = 'force-dynamic'
 
@@ -23,6 +24,7 @@ export async function POST(request: NextRequest) {
   }
 
   const document = await saveKnowledgeDocument(payload.data)
+  const indexing = await indexKnowledgeDocument({ document })
   const documents = await listKnowledgeDocuments()
-  return NextResponse.json({ ok: true, document, documents })
+  return NextResponse.json({ ok: true, document, documents, indexing })
 }

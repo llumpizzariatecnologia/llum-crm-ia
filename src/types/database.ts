@@ -180,6 +180,24 @@ export interface KnowledgeDocument {
   updated_at: string
 }
 
+export interface KnowledgeChunk {
+  id: string
+  workspace_id: string | null
+  document_id: string
+  chunk_index: number
+  section_title: string | null
+  page_start: number | null
+  page_end: number | null
+  token_estimate: number
+  content: string
+  summary: string | null
+  tags: string[]
+  embedding: string | null
+  status: 'draft' | 'published' | 'archived'
+  created_at: string
+  updated_at: string
+}
+
 export interface WhatsappChannelConfig {
   id: string
   workspace_id: string | null
@@ -343,6 +361,11 @@ export type Database = {
         Insert: Omit<KnowledgeDocument, 'id' | 'created_at' | 'updated_at'>
         Update: Partial<KnowledgeDocument>
       }
+      knowledge_chunks: {
+        Row: KnowledgeChunk
+        Insert: Omit<KnowledgeChunk, 'id' | 'created_at' | 'updated_at'>
+        Update: Partial<KnowledgeChunk>
+      }
       whatsapp_channel_configs: {
         Row: WhatsappChannelConfig
         Insert: Omit<WhatsappChannelConfig, 'id' | 'created_at' | 'updated_at'>
@@ -352,6 +375,26 @@ export type Database = {
         Row: WhatsappTemplate
         Insert: Omit<WhatsappTemplate, 'id' | 'created_at' | 'updated_at'>
         Update: Partial<WhatsappTemplate>
+      }
+    }
+    Functions: {
+      match_knowledge_chunks: {
+        Args: {
+          query_embedding: string
+          query_workspace_id: string
+          match_count?: number
+        }
+        Returns: Array<{
+          id: string
+          document_id: string
+          title: string
+          category: string
+          summary: string | null
+          section_title: string | null
+          content: string
+          score: number
+          tags: Json
+        }>
       }
     }
   }

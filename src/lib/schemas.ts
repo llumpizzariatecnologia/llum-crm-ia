@@ -57,8 +57,8 @@ export const knowledgeDocumentSchema = z.object({
   title: z.string().trim().min(3).max(120),
   category: z.string().trim().min(2).max(60),
   sourceType: z.enum(['faq', 'policy', 'menu', 'pricing', 'operations', 'custom']),
-  content: z.string().trim().min(20).max(12000),
-  summary: z.string().trim().max(300).optional().default(''),
+  content: z.string().trim().min(20).max(100000),
+  summary: z.string().trim().max(600).optional().default(''),
   tags: z.array(z.string().trim().min(1).max(40)).max(12).default([]),
   status: z.enum(['draft', 'published', 'archived']),
 })
