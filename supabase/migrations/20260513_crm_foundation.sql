@@ -133,33 +133,41 @@ alter table public.ai_runs enable row level security;
 alter table public.decision_logs enable row level security;
 alter table public.whatsapp_settings enable row level security;
 
-create policy if not exists tenants_authenticated_select on public.tenants
+drop policy if exists tenants_authenticated_select on public.tenants;
+create policy tenants_authenticated_select on public.tenants
   for select using (auth.role() = 'authenticated');
 
-create policy if not exists contacts_workspace_isolation on public.contacts
+drop policy if exists contacts_workspace_isolation on public.contacts;
+create policy contacts_workspace_isolation on public.contacts
   for all using (auth.role() = 'authenticated')
   with check (auth.role() = 'authenticated');
 
-create policy if not exists conversations_workspace_isolation on public.conversations_v2
+drop policy if exists conversations_workspace_isolation on public.conversations_v2;
+create policy conversations_workspace_isolation on public.conversations_v2
   for all using (auth.role() = 'authenticated')
   with check (auth.role() = 'authenticated');
 
-create policy if not exists messages_workspace_isolation on public.messages
+drop policy if exists messages_workspace_isolation on public.messages;
+create policy messages_workspace_isolation on public.messages
   for all using (auth.role() = 'authenticated')
   with check (auth.role() = 'authenticated');
 
-create policy if not exists leads_workspace_isolation on public.leads_v2
+drop policy if exists leads_workspace_isolation on public.leads_v2;
+create policy leads_workspace_isolation on public.leads_v2
   for all using (auth.role() = 'authenticated')
   with check (auth.role() = 'authenticated');
 
-create policy if not exists ai_runs_workspace_isolation on public.ai_runs
+drop policy if exists ai_runs_workspace_isolation on public.ai_runs;
+create policy ai_runs_workspace_isolation on public.ai_runs
   for all using (auth.role() = 'authenticated')
   with check (auth.role() = 'authenticated');
 
-create policy if not exists decision_logs_workspace_isolation on public.decision_logs
+drop policy if exists decision_logs_workspace_isolation on public.decision_logs;
+create policy decision_logs_workspace_isolation on public.decision_logs
   for all using (auth.role() = 'authenticated')
   with check (auth.role() = 'authenticated');
 
-create policy if not exists whatsapp_settings_workspace_isolation on public.whatsapp_settings
+drop policy if exists whatsapp_settings_workspace_isolation on public.whatsapp_settings;
+create policy whatsapp_settings_workspace_isolation on public.whatsapp_settings
   for all using (auth.role() = 'authenticated')
   with check (auth.role() = 'authenticated');

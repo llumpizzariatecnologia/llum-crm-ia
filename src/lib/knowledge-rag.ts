@@ -11,9 +11,17 @@ export const KNOWLEDGE_EMBEDDING_MODEL = 'text-embedding-3-small'
 export const KNOWLEDGE_CHUNK_MAX_WORDS = 280
 export const KNOWLEDGE_CHUNK_OVERLAP_WORDS = 60
 export const KNOWLEDGE_RETRIEVAL_LIMIT = 5
+// Cosine-similarity floor for semantic matches. `match_knowledge_chunks` returns
+// `1 - (embedding <=> query)`, so values < 0.55 mean "weak match" with text-embedding-3-small.
+export const KNOWLEDGE_SEMANTIC_MIN_SCORE = 0.55
+// Minimum token-overlap for the lexical fallback to be trustworthy.
+export const KNOWLEDGE_LEXICAL_MIN_HITS = 2
 
 export type KnowledgeMatch = {
+  /** chunk-level ID when sourced from semantic search; document-level ID for lexical */
   id: string
+  documentId: string
+  chunkId: string | null
   title: string
   category: string
   summary: string | null
@@ -165,15 +173,22 @@ function buildKnowledgeChunks(text: string) {
   let chunkIndex = 0
 
   for (const section of sections) {
-    const words = section.lines.join(' ').split(/\s+/).filter(Boolean)
-    if (!words.length) continue
+    // Group lines into paragraphs (split on blank lines), then pack paragraphs
+    // into chunks respecting KNOWLEDGE_CHUNK_MAX_WORDS. This avoids cutting
+    // mid-sentence at an arbitrary word boundary.
+    const paragraphs = section.lines
+      .join('\n')
+      .split(/\n{2,}/)
+      .map((p) => p.replace(/\s+/g, ' ').trim())
+      .filter((p) => p.length >= 20)
 
-    let start = 0
-    while (start < words.length) {
-      const end = Math.min(start + KNOWLEDGE_CHUNK_MAX_WORDS, words.length)
-      const chunkWords = words.slice(start, end)
-      const content = chunkWords.join(' ').trim()
+    if (!paragraphs.length) continue
 
+    let currentWords: string[] = []
+
+    const flushChunk = () => {
+      if (!currentWords.length) return
+      const content = currentWords.join(' ').trim()
       if (content.length >= 40) {
         chunks.push({
           chunkIndex,
@@ -184,10 +199,22 @@ function buildKnowledgeChunks(text: string) {
         })
         chunkIndex += 1
       }
-
-      if (end >= words.length) break
-      start = Math.max(end - KNOWLEDGE_CHUNK_OVERLAP_WORDS, start + 1)
     }
+
+    for (const para of paragraphs) {
+      const paraWords = para.split(/\s+/).filter(Boolean)
+
+      // If adding this paragraph would exceed the max, flush first with overlap.
+      if (currentWords.length + paraWords.length > KNOWLEDGE_CHUNK_MAX_WORDS && currentWords.length > 0) {
+        flushChunk()
+        // Carry overlap from the tail of the flushed chunk.
+        currentWords = currentWords.slice(-KNOWLEDGE_CHUNK_OVERLAP_WORDS)
+      }
+
+      currentWords.push(...paraWords)
+    }
+
+    flushChunk()
   }
 
   return chunks
@@ -385,6 +412,114 @@ export async function importKnowledgePdf(input: {
   }
 }
 
+function extractMarkdownText(raw: string): string {
+  return raw
+    .replace(/```[\s\S]*?```/g, '')          // fenced code blocks
+    .replace(/`[^`]+`/g, '')                  // inline code
+    .replace(/!\[.*?\]\(.*?\)/g, '')          // images
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // links → keep label
+    .replace(/^#{1,6}\s+/gm, '')             // headings — keep text
+    .replace(/[*_]{1,2}([^*_]+)[*_]{1,2}/g, '$1') // bold/italic
+    .replace(/^\s*[-*+]\s+/gm, '')           // list bullets
+    .replace(/^\s*\d+\.\s+/gm, '')           // numbered lists
+    .replace(/^\s*>\s+/gm, '')               // blockquotes
+    .replace(/\|/g, ' ')                     // table cells
+    .replace(/[-]{3,}/g, '')                 // horizontal rules
+    .trim()
+}
+
+export async function importKnowledgeMarkdown(input: {
+  buffer: Buffer
+  fileName: string
+  title?: string
+  category?: string
+  sourceType?: KnowledgeDocument['source_type']
+  summary?: string
+  tags?: string[]
+  status?: KnowledgeDocument['status']
+  workspaceId?: string
+}) {
+  const raw = input.buffer.toString('utf-8')
+  const extractedText = normalizeKnowledgeText(extractMarkdownText(raw))
+  if (extractedText.length < 40) {
+    throw new Error('Nao foi possivel extrair texto util do arquivo Markdown.')
+  }
+
+  const title =
+    input.title?.trim() ||
+    raw.match(/^#\s+(.+)/m)?.[1]?.trim() ||
+    buildImportedDocumentTitle(input.fileName.replace(/\.md$/i, ''))
+  const summary = input.summary?.trim() || summarizeChunk(extractedText)
+
+  const document = await saveKnowledgeDocument(
+    {
+      title,
+      category: input.category?.trim() || 'operacoes',
+      sourceType: input.sourceType || 'operations',
+      content: extractedText,
+      summary,
+      tags: (input.tags || []).filter(Boolean),
+      status: input.status || 'published',
+    },
+    input.workspaceId
+  )
+
+  const indexed = await indexKnowledgeDocument({ document, workspaceId: input.workspaceId })
+  return { document, extractedChars: extractedText.length, ...indexed }
+}
+
+function csvToText(raw: string): string {
+  const lines = raw.split(/\r?\n/).filter((l) => l.trim())
+  if (!lines.length) return ''
+  const separator = lines[0].includes('\t') ? '\t' : ','
+  const headers = lines[0].split(separator).map((h) => h.replace(/^["']|["']$/g, '').trim())
+  const rows = lines.slice(1)
+  return rows
+    .map((row) => {
+      const values = row.split(separator).map((v) => v.replace(/^["']|["']$/g, '').trim())
+      return headers.map((h, i) => `${h}: ${values[i] ?? ''}`).join(' | ')
+    })
+    .filter((row) => row.length > 10)
+    .join('\n')
+}
+
+export async function importKnowledgeCsv(input: {
+  buffer: Buffer
+  fileName: string
+  title?: string
+  category?: string
+  sourceType?: KnowledgeDocument['source_type']
+  summary?: string
+  tags?: string[]
+  status?: KnowledgeDocument['status']
+  workspaceId?: string
+}) {
+  const raw = input.buffer.toString('utf-8')
+  const extractedText = normalizeKnowledgeText(csvToText(raw))
+  if (extractedText.length < 40) {
+    throw new Error('Nao foi possivel extrair texto util do arquivo CSV.')
+  }
+
+  const title = input.title?.trim() || buildImportedDocumentTitle(input.fileName.replace(/\.csv$/i, ''))
+  const summary = input.summary?.trim() || summarizeChunk(extractedText)
+
+  const document = await saveKnowledgeDocument(
+    {
+      title,
+      category: input.category?.trim() || 'operacoes',
+      sourceType: input.sourceType || 'operations',
+      content: extractedText,
+      summary,
+      tags: (input.tags || []).filter(Boolean),
+      status: input.status || 'published',
+    },
+    input.workspaceId
+  )
+
+  const indexed = await indexKnowledgeDocument({ document, workspaceId: input.workspaceId })
+  return { document, extractedChars: extractedText.length, ...indexed }
+}
+
 async function getLexicalDocumentMatches(
   message: string,
   workspaceId?: string
@@ -414,6 +549,8 @@ async function getLexicalDocumentMatches(
 
       return {
         id: document.id,
+        documentId: document.id,
+        chunkId: null,
         title: document.title,
         category: document.category,
         summary: document.summary,
@@ -421,7 +558,7 @@ async function getLexicalDocumentMatches(
         score,
       }
     })
-    .filter((item) => item.score > 0)
+    .filter((item) => item.score >= KNOWLEDGE_LEXICAL_MIN_HITS)
     .sort((a, b) => b.score - a.score)
     .slice(0, 3)
 }
@@ -457,9 +594,11 @@ export async function searchKnowledgeMatches(
   }
 
   const semanticMatches = (data as SemanticChunkRow[])
-    .filter((item) => item.score > 0)
-    .map((item) => ({
+    .filter((item) => item.score >= KNOWLEDGE_SEMANTIC_MIN_SCORE)
+    .map((item): KnowledgeMatch => ({
       id: item.id,
+      documentId: item.document_id,
+      chunkId: item.id,
       title: item.section_title ? `${item.title} - ${item.section_title}` : item.title,
       category: item.category,
       summary: item.summary,
@@ -467,14 +606,65 @@ export async function searchKnowledgeMatches(
       score: item.score,
     }))
 
-  const merged = new Map<string, KnowledgeMatch>()
-  for (const match of [...semanticMatches, ...lexicalMatches]) {
-    if (!merged.has(match.id)) {
-      merged.set(match.id, match)
-    }
+  // RRF blends lexical and semantic rankings without comparing incompatible scales.
+  const RRF_K = 60
+  const fused = new Map<string, KnowledgeMatch & { rrfScore: number }>()
+
+  const indexRanking = (matches: KnowledgeMatch[]) => {
+    matches.forEach((match, index) => {
+      const contribution = 1 / (RRF_K + index + 1)
+      const existing = fused.get(match.id)
+      if (existing) {
+        existing.rrfScore += contribution
+        return
+      }
+      fused.set(match.id, { ...match, rrfScore: contribution })
+    })
   }
 
-  return Array.from(merged.values())
-    .sort((a, b) => b.score - a.score)
+  indexRanking(semanticMatches)
+  indexRanking(lexicalMatches)
+
+  // Query-aware reranker: boost chunks that contain query tokens densely in the excerpt.
+  // Tokens near the start of the excerpt get higher weight (positional decay).
+  const queryTokens = message
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= 3)
+
+  const rerankBoost = (entry: KnowledgeMatch): number => {
+    if (!queryTokens.length) return 0
+    const text = entry.excerpt
+      .normalize('NFD')
+      .replace(/[̀-ͯ]/g, '')
+      .toLowerCase()
+    const words = text.split(/\s+/)
+    let boost = 0
+    for (const token of queryTokens) {
+      const pos = words.findIndex((w) => w.startsWith(token))
+      if (pos >= 0) {
+        boost += 1 / (1 + pos * 0.05)
+      }
+    }
+    return boost / queryTokens.length
+  }
+
+  return Array.from(fused.values())
+    .map((entry) => ({ entry, finalScore: entry.rrfScore + rerankBoost(entry) * 0.3 }))
+    .sort((a, b) => b.finalScore - a.finalScore)
     .slice(0, KNOWLEDGE_RETRIEVAL_LIMIT)
+    .map(
+      ({ entry }): KnowledgeMatch => ({
+        id: entry.id,
+        documentId: entry.documentId,
+        chunkId: entry.chunkId,
+        title: entry.title,
+        category: entry.category,
+        summary: entry.summary,
+        excerpt: entry.excerpt,
+        score: entry.score,
+      })
+    )
 }

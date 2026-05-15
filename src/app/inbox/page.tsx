@@ -23,6 +23,42 @@ const filters = [
   { label: 'Fechadas', value: 'closed' },
 ]
 
+// SLA buckets in minutes since the last inbound message. Pending inbounds (no
+// outbound after them) escalate from fresh → warm → hot → cold.
+function getSlaState(
+  conversation: ConversationWithCustomer
+): { bucket: 'fresh' | 'warm' | 'hot' | 'cold' | 'idle'; minutes: number } {
+  const lastInbound = conversation.last_inbound_at
+  const lastOutbound = conversation.last_outbound_at
+  if (!lastInbound) return { bucket: 'idle', minutes: 0 }
+  // If we already replied after the last inbound, conversation is idle.
+  if (lastOutbound && new Date(lastOutbound) > new Date(lastInbound)) {
+    return { bucket: 'idle', minutes: 0 }
+  }
+  const minutes = Math.max(0, Math.floor((Date.now() - new Date(lastInbound).getTime()) / 60000))
+  if (minutes < 5) return { bucket: 'fresh', minutes }
+  if (minutes < 30) return { bucket: 'warm', minutes }
+  if (minutes < 180) return { bucket: 'hot', minutes }
+  return { bucket: 'cold', minutes }
+}
+
+const SLA_DOT_CLASS: Record<ReturnType<typeof getSlaState>['bucket'], string> = {
+  idle: 'bg-[#cdd6e2]',
+  fresh: 'bg-[#17884b]',
+  warm: 'bg-[#e5b30a]',
+  hot: 'bg-[#e6603f]',
+  cold: 'bg-[#c7245d]',
+}
+
+function urgencyRank(c: ConversationWithCustomer): number {
+  // Lower = more urgent (sorted ascending).
+  if (c.status === 'handoff_requested') return 0
+  const sla = getSlaState(c)
+  if (sla.bucket === 'idle') return 1000
+  // Older pending inbounds float to the top of the same status.
+  return 100 - Math.min(sla.minutes, 90)
+}
+
 export default function InboxPage() {
   const [conversations, setConversations] = useState<ConversationWithCustomer[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(() => {
@@ -30,8 +66,14 @@ export default function InboxPage() {
     return new URLSearchParams(window.location.search).get('conversation')
   })
   const [detail, setDetail] = useState<ConversationDetail | null>(null)
-  const [filter, setFilter] = useState('all')
-  const [search, setSearch] = useState('')
+  const [filter, setFilter] = useState<string>(() => {
+    if (typeof window === 'undefined') return 'all'
+    return new URLSearchParams(window.location.search).get('filter') || 'all'
+  })
+  const [search, setSearch] = useState<string>(() => {
+    if (typeof window === 'undefined') return ''
+    return new URLSearchParams(window.location.search).get('q') || ''
+  })
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
@@ -142,17 +184,33 @@ export default function InboxPage() {
     messageViewportRef.current.scrollTop = messageViewportRef.current.scrollHeight
   }, [detail, selectedId])
 
+  // Keep filter / search / selection synced to the URL so refreshing preserves context.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const params = new URLSearchParams(window.location.search)
+    if (filter && filter !== 'all') params.set('filter', filter)
+    else params.delete('filter')
+    if (search) params.set('q', search)
+    else params.delete('q')
+    if (selectedId) params.set('conversation', selectedId)
+    else params.delete('conversation')
+    const qs = params.toString()
+    window.history.replaceState(null, '', qs ? `?${qs}` : window.location.pathname)
+  }, [filter, search, selectedId])
+
   const filtered = useMemo(() => {
-    return conversations.filter((conversation) => {
-      if (filter === 'unread') return conversation.unread_count > 0
-      if (filter !== 'all' && conversation.status !== filter) return false
-      if (!search) return true
-      const q = search.toLowerCase()
-      return (
-        conversation.customers?.name?.toLowerCase().includes(q) ||
-        conversation.customers?.phone?.toLowerCase().includes(q)
-      )
-    })
+    return conversations
+      .filter((conversation) => {
+        if (filter === 'unread') return conversation.unread_count > 0
+        if (filter !== 'all' && conversation.status !== filter) return false
+        if (!search) return true
+        const q = search.toLowerCase()
+        return (
+          conversation.customers?.name?.toLowerCase().includes(q) ||
+          conversation.customers?.phone?.toLowerCase().includes(q)
+        )
+      })
+      .sort((a, b) => urgencyRank(a) - urgencyRank(b))
   }, [conversations, filter, search])
 
   async function handleSend() {
@@ -198,6 +256,15 @@ export default function InboxPage() {
 
   async function updateStatus(status: 'ai_active' | 'human_active' | 'handoff_requested' | 'closed') {
     if (!selectedId) return
+    if (
+      status === 'closed' &&
+      typeof window !== 'undefined' &&
+      !window.confirm(
+        'Encerrar este atendimento? O cliente recebera a mensagem de despedida e a conversa sera marcada como fechada.'
+      )
+    ) {
+      return
+    }
     setSubmitting(true)
     setError(null)
     setStatusFeedback(null)
@@ -322,6 +389,13 @@ export default function InboxPage() {
         <div className="min-h-0 flex-1 overflow-y-auto divide-y divide-[#e6edf5]">
           {filtered.map((conversation) => {
             const active = conversation.id === selectedId
+            const sla = getSlaState(conversation)
+            const slaLabel =
+              sla.bucket === 'idle'
+                ? null
+                : sla.minutes < 60
+                  ? `${sla.minutes}min sem resposta`
+                  : `${Math.floor(sla.minutes / 60)}h sem resposta`
             return (
               <button
                 key={conversation.id}
@@ -331,8 +405,15 @@ export default function InboxPage() {
                   active ? 'bg-white shadow-[inset_3px_0_0_#533afd]' : 'hover:bg-white/80'
                 )}
               >
-                <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[#eef2ff] text-sm font-medium text-[#533afd]">
+                <div className="relative flex h-11 w-11 items-center justify-center rounded-2xl bg-[#eef2ff] text-sm font-medium text-[#533afd]">
                   {conversation.customers?.name?.slice(0, 1) || '?'}
+                  <span
+                    aria-hidden
+                    className={cn(
+                      'absolute -right-0.5 -top-0.5 h-3 w-3 rounded-full ring-2 ring-[#f6f9fc]',
+                      SLA_DOT_CLASS[sla.bucket]
+                    )}
+                  />
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
@@ -344,6 +425,11 @@ export default function InboxPage() {
                         {conversation.unread_count}
                       </span>
                     ) : null}
+                    {conversation.status === 'handoff_requested' ? (
+                      <span className="rounded-full bg-[#fff3dd] px-2 py-0.5 text-[10px] font-medium text-[#a85a05]">
+                        Handoff
+                      </span>
+                    ) : null}
                   </div>
                   <p className="mt-1 truncate text-sm text-[#64748d]">
                     {conversation.last_message_preview || 'Sem previa'}
@@ -351,8 +437,27 @@ export default function InboxPage() {
                   <div className="mt-2 flex items-center gap-2 text-[11px] text-[#7a8ca2]">
                     <Phone className="h-3 w-3" />
                     <span>{conversation.customers?.phone || 'sem telefone'}</span>
-                    <span>·</span>
-                    <span>{conversation.current_intent || 'sem intencao'}</span>
+                    {slaLabel ? (
+                      <>
+                        <span>·</span>
+                        <span
+                          className={cn(
+                            sla.bucket === 'hot' || sla.bucket === 'cold'
+                              ? 'text-[#c7245d]'
+                              : sla.bucket === 'warm'
+                                ? 'text-[#a85a05]'
+                                : 'text-[#17884b]'
+                          )}
+                        >
+                          {slaLabel}
+                        </span>
+                      </>
+                    ) : conversation.current_intent ? (
+                      <>
+                        <span>·</span>
+                        <span>{conversation.current_intent}</span>
+                      </>
+                    ) : null}
                   </div>
                 </div>
               </button>

@@ -137,6 +137,7 @@ export interface Integration {
   label?: string | null
   masked_preview?: string | null
   status: string
+  is_active?: boolean
   last_validated_at: string | null
   validation_error?: string | null
   created_at: string
@@ -212,6 +213,9 @@ export interface WhatsappChannelConfig {
   max_message_chars: number
   split_message_delay_seconds: number
   status: 'draft' | 'connected' | 'attention' | 'disconnected'
+  label?: string | null
+  is_active?: boolean
+  integration_id?: string | null
   connected_at: string | null
   last_healthcheck_at: string | null
   created_at: string

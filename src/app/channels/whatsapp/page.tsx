@@ -1,7 +1,7 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { Loader2, Radio, Save, ShieldCheck } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { CheckCircle2, Circle, Loader2, Radio, Save, ShieldCheck } from 'lucide-react'
 import { fetchJson } from '@/lib/client'
 
 type ChannelConfig = {
@@ -26,6 +26,22 @@ type Integration = {
   last_validated_at?: string | null
 }
 
+type WhatsappEnvironment = {
+  integrationId: string
+  channelConfigId: string | null
+  label: string
+  displayName: string
+  phoneNumberId: string | null
+  wabaId: string | null
+  webhookUrl: string | null
+  status: string
+  isActive: boolean
+  hasAccessToken: boolean
+  hasAppSecret: boolean
+  verifyTokenPreview: string | null
+  maskedAccessToken: string | null
+}
+
 const emptyConfig: ChannelConfig = {
   displayName: 'LLUM WhatsApp Oficial',
   phoneNumberId: '',
@@ -43,22 +59,31 @@ const emptyConfig: ChannelConfig = {
 export default function WhatsappPage() {
   const [config, setConfig] = useState<ChannelConfig>(emptyConfig)
   const [integrations, setIntegrations] = useState<Integration[]>([])
+  const [environments, setEnvironments] = useState<WhatsappEnvironment[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [activatingId, setActivatingId] = useState<string | null>(null)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+
+  const reloadConfig = useCallback(async () => {
+    const configData = await fetchJson<{ config: ChannelConfig }>('/api/whatsapp/config')
+    setConfig(configData.config)
+  }, [])
 
   useEffect(() => {
     let active = true
     const run = async () => {
       try {
-        const [configData, integrationData] = await Promise.all([
+        const [configData, integrationData, envsData] = await Promise.all([
           fetchJson<{ config: ChannelConfig }>('/api/whatsapp/config'),
           fetchJson<{ integrations: Integration[] }>('/api/integrations'),
+          fetchJson<{ environments: WhatsappEnvironment[] }>('/api/whatsapp/environments'),
         ])
         if (!active) return
         setConfig(configData.config)
         setIntegrations(integrationData.integrations)
+        setEnvironments(envsData.environments)
       } catch (err) {
         if (active) setError((err as Error).message)
       } finally {
@@ -70,6 +95,29 @@ export default function WhatsappPage() {
       active = false
     }
   }, [])
+
+  async function activateEnvironment(integrationId: string) {
+    setActivatingId(integrationId)
+    setError(null)
+    setMessage(null)
+    try {
+      const data = await fetchJson<{ environments: WhatsappEnvironment[] }>(
+        '/api/whatsapp/environments',
+        {
+          method: 'POST',
+          body: JSON.stringify({ integrationId }),
+        }
+      )
+      setEnvironments(data.environments)
+      await reloadConfig()
+      const activated = data.environments.find((env) => env.integrationId === integrationId)
+      setMessage(`Ambiente "${activated?.label || 'WhatsApp'}" ativado. Saídas usam este número.`)
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setActivatingId(null)
+    }
+  }
 
   async function save() {
     setSaving(true)
@@ -115,6 +163,89 @@ export default function WhatsappPage() {
 
       {message ? <div className="mt-4 rounded-2xl border border-[#dcefe3] bg-[#f2fbf5] px-4 py-3 text-sm text-[#17884b]">{message}</div> : null}
       {error ? <div className="mt-4 rounded-2xl border border-[#fde5ee] bg-[#fff7fa] px-4 py-3 text-sm text-[#c7245d]">{error}</div> : null}
+
+      {environments.length > 0 ? (
+        <section className="surface-card mt-6 p-6">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <h2 className="heading-card">Ambientes WhatsApp</h2>
+              <p className="mt-1 text-sm text-[#64748d]">
+                O ambiente ativo é usado para enviar respostas e aparece nos formulários abaixo. Webhooks recebidos de qualquer número configurado continuam funcionando.
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-5 grid gap-3 md:grid-cols-2">
+            {environments.map((env) => {
+              const active = env.isActive
+              return (
+                <div
+                  key={env.integrationId}
+                  className={`rounded-[26px] border px-5 py-4 transition ${
+                    active
+                      ? 'border-[#533afd] bg-[#f5f7ff] shadow-[0_10px_28px_rgba(83,58,253,0.08)]'
+                      : 'border-[#e3eaf3] bg-white'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-2">
+                      {active ? (
+                        <CheckCircle2 className="mt-0.5 h-5 w-5 text-[#533afd]" />
+                      ) : (
+                        <Circle className="mt-0.5 h-5 w-5 text-[#cad6e4]" />
+                      )}
+                      <div>
+                        <p className="text-sm font-medium text-[#0d253d]">{env.label}</p>
+                        <p className="text-xs text-[#7a8ca2]">{env.displayName}</p>
+                      </div>
+                    </div>
+                    {active ? (
+                      <span className="rounded-full bg-[#533afd] px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.08em] text-white">
+                        Ativo
+                      </span>
+                    ) : (
+                      <button
+                        onClick={() => activateEnvironment(env.integrationId)}
+                        disabled={activatingId !== null}
+                        className="rounded-full border border-[#cad6e4] bg-white px-3 py-1 text-xs font-medium text-[#0d253d] transition hover:border-[#533afd] hover:text-[#533afd] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {activatingId === env.integrationId ? 'Ativando…' : 'Ativar'}
+                      </button>
+                    )}
+                  </div>
+
+                  <dl className="mt-3 grid grid-cols-1 gap-1 text-xs text-[#5e6d82]">
+                    <div className="flex justify-between gap-3">
+                      <dt className="text-[#7a8ca2]">Phone ID</dt>
+                      <dd className="font-mono text-[11px] text-[#0d253d]">{env.phoneNumberId || '—'}</dd>
+                    </div>
+                    <div className="flex justify-between gap-3">
+                      <dt className="text-[#7a8ca2]">WABA</dt>
+                      <dd className="font-mono text-[11px] text-[#0d253d]">{env.wabaId || '—'}</dd>
+                    </div>
+                    <div className="flex justify-between gap-3">
+                      <dt className="text-[#7a8ca2]">Verify token</dt>
+                      <dd className="font-mono text-[11px] text-[#0d253d]">{env.verifyTokenPreview || '—'}</dd>
+                    </div>
+                    <div className="flex justify-between gap-3">
+                      <dt className="text-[#7a8ca2]">Access token</dt>
+                      <dd className="font-mono text-[11px] text-[#0d253d]">{env.maskedAccessToken || '—'}</dd>
+                    </div>
+                    {env.webhookUrl ? (
+                      <div className="flex justify-between gap-3">
+                        <dt className="text-[#7a8ca2]">Webhook</dt>
+                        <dd className="truncate text-[11px] text-[#0d253d]" title={env.webhookUrl}>
+                          {env.webhookUrl}
+                        </dd>
+                      </div>
+                    ) : null}
+                  </dl>
+                </div>
+              )
+            })}
+          </div>
+        </section>
+      ) : null}
 
       <div className="mt-6 grid gap-6 xl:grid-cols-[1fr_340px]">
         <section className="surface-card p-6">

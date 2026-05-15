@@ -1,20 +1,22 @@
 import 'server-only'
 
 import { randomUUID } from 'node:crypto'
+import { z } from 'zod'
 import { decrypt, encrypt, maskCredential } from '@/lib/encryption'
 import {
   CRM_CONFIG_PROVIDER,
   DEFAULT_CLOSING_MESSAGE,
   DEFAULT_WORKSPACE_ID,
-  FALLBACK_REPLY,
   KNOWN_INTEGRATION_PROVIDERS,
 } from '@/lib/constants'
 import { getServerSupabaseClient } from '@/lib/server/supabase'
 import {
   getPrimaryAgentProfile,
   getWhatsappChannelConfig,
+  getWhatsappChannelConfigByPhoneNumberId,
 } from '@/lib/workspace-admin'
 import { searchKnowledgeMatches, type KnowledgeMatch } from '@/lib/knowledge-rag'
+import { checkAvailability, type AvailabilityResult } from '@/lib/reservations'
 import type {
   AgentRun,
   AgentProfile,
@@ -59,6 +61,7 @@ type ClassificationResult = {
   extractedData?: Record<string, unknown>
   source: 'provider' | 'openai' | 'heuristic'
   knowledgeDocumentIds: string[]
+  knowledgeChunkIds: string[]
   modelUsed?: string
   providerUsed?: string
 }
@@ -164,7 +167,17 @@ function isShortAffirmationMessage(value: string) {
   )
 }
 
-function formatAgentReplyBlocks(value: string) {
+// Splits a paragraph into sentences without breaking inside URLs, decimals or
+// abbreviations. The boundary is punctuation followed by whitespace (or end of
+// string), so "vercel.app" and "R$ 5,00" stay intact.
+function splitIntoSentences(paragraph: string): string[] {
+  return paragraph
+    .split(/(?<=[.!?])\s+(?=[A-Za-zÀ-ÿ0-9])/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+}
+
+function formatAgentReplyBlocks(value: string, maxBlockChars = 220) {
   const normalized = value
     .replace(/\r/g, '')
     .replace(/\n{3,}/g, '\n\n')
@@ -172,36 +185,57 @@ function formatAgentReplyBlocks(value: string) {
     .trim()
 
   if (!normalized) return value
-  const blocks: string[] = []
   const paragraphs = normalized.includes('\n\n')
-    ? normalized
-        .split(/\n{2,}/)
-        .map((block) => block.trim())
-        .filter(Boolean)
+    ? normalized.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean)
     : [normalized]
 
+  const blocks: string[] = []
   for (const paragraph of paragraphs) {
-    const parts =
-      paragraph.match(/[^,.;!?]+(?:[,.;!?]+|$)/g)?.map((item) => item.trim()).filter(Boolean) || [
-        paragraph,
-      ]
+    const sentences = splitIntoSentences(paragraph)
+    if (sentences.length === 0) {
+      blocks.push(paragraph)
+      continue
+    }
 
     let current = ''
-    for (const part of parts) {
-      const next = current ? `${current} ${part}` : part
-      if (current.length > 0 && next.length > 160) {
-        blocks.push(current.trim())
-        current = part
+    for (const sentence of sentences) {
+      const next = current ? `${current} ${sentence}` : sentence
+      if (current.length > 0 && next.length > maxBlockChars) {
+        blocks.push(current)
+        current = sentence
         continue
       }
-
       current = next
     }
 
-    if (current.trim()) blocks.push(current.trim())
+    if (current) blocks.push(current)
   }
 
   return blocks.join('\n\n')
+}
+
+function truncateReplyToLimit(value: string, maxChars: number) {
+  if (!value || value.length <= maxChars) return value
+
+  const sentences = splitIntoSentences(value.replace(/\s+/g, ' ').trim())
+  let assembled = ''
+  for (const sentence of sentences) {
+    const next = assembled ? `${assembled} ${sentence}` : sentence
+    if (next.length > maxChars) break
+    assembled = next
+  }
+
+  if (assembled.length >= 60) return assembled
+
+  // No clean sentence boundary fit — fall back to word-aware truncation.
+  const words = value.split(/\s+/).filter(Boolean)
+  let wordChunk = ''
+  for (const word of words) {
+    const next = wordChunk ? `${wordChunk} ${word}` : word
+    if (next.length > maxChars - 1) break
+    wordChunk = next
+  }
+  return `${wordChunk.trim()}…`
 }
 
 function splitLongWhatsAppMessage(body: string, maxChars: number) {
@@ -246,12 +280,10 @@ function splitLongWhatsAppMessage(body: string, maxChars: number) {
   }
 
   for (const paragraph of paragraphs) {
-    const segments =
-      paragraph.match(/[^,.;!?]+(?:[,.;!?]+|$)/g)?.map((item) => item.trim()).filter(Boolean) || [
-        paragraph,
-      ]
+    const segments = splitIntoSentences(paragraph)
+    const safeSegments = segments.length > 0 ? segments : [paragraph]
 
-    for (const segment of segments) {
+    for (const segment of safeSegments) {
       const fittedSegments = fitSegment(segment)
       for (const fitted of fittedSegments) {
         const next = current ? `${current} ${fitted}` : fitted
@@ -571,15 +603,204 @@ export async function getDecryptedIntegration(
 ): Promise<StoredIntegrationPayload | null> {
   const supabase = getServerSupabaseClient()
   const workspace = getIntegrationWorkspaceId(workspaceId)
-  let query = supabase.from('integrations').select('encrypted_credentials').eq('provider', provider)
+  let query = supabase
+    .from('integrations')
+    .select('encrypted_credentials, is_active')
+    .eq('provider', provider)
   query = workspace ? query.eq('workspace_id', workspace) : query.is('workspace_id', null)
-  const { data } = (await query.maybeSingle()) as {
+  // Prefer the active row; fall back to whatever exists for backward compat
+  // with pre-migration rows that don't have `is_active` populated yet.
+  const { data } = (await query
+    .order('is_active', { ascending: false })
+    .limit(1)
+    .maybeSingle()) as {
     data: { encrypted_credentials: string | null } | null
   }
 
   if (!data?.encrypted_credentials) return null
   const decrypted = await decrypt(data.encrypted_credentials)
   return JSON.parse(decrypted) as StoredIntegrationPayload
+}
+
+/** Decrypted view of a stored integration credentials row. */
+export type WhatsappEnvironmentRow = {
+  integrationId: string
+  channelConfigId: string | null
+  label: string
+  displayName: string
+  phoneNumberId: string | null
+  wabaId: string | null
+  webhookUrl: string | null
+  status: string
+  isActive: boolean
+  hasAccessToken: boolean
+  hasAppSecret: boolean
+  verifyTokenPreview: string | null
+  maskedAccessToken: string | null
+}
+
+type WhatsappIntegrationRow = {
+  id: string
+  label: string | null
+  is_active: boolean | null
+  encrypted_credentials: string
+  status: string | null
+}
+
+type WhatsappChannelConfigRow = {
+  id: string
+  display_name: string
+  phone_number_id: string
+  waba_id: string
+  webhook_url: string | null
+  status: string
+  label: string | null
+  is_active: boolean | null
+  integration_id: string | null
+}
+
+function maskToken(token: string | undefined | null, head = 8, tail = 6) {
+  if (!token) return null
+  if (token.length <= head + tail) return '****'
+  return `${token.slice(0, head)}...${token.slice(-tail)}`
+}
+
+function maskVerifyToken(token: string | undefined | null) {
+  if (!token) return null
+  if (token.length <= 4) return '****'
+  return `${token.slice(0, 4)}...${token.slice(-2)}`
+}
+
+export async function listWhatsappEnvironments(
+  workspaceId?: string
+): Promise<WhatsappEnvironmentRow[]> {
+  const supabase = getServerSupabaseClient()
+  const workspace = getIntegrationWorkspaceId(workspaceId)
+
+  let integrationsQuery = supabase
+    .from('integrations')
+    .select('id, label, is_active, encrypted_credentials, status')
+    .eq('provider', 'whatsapp')
+  integrationsQuery = workspace
+    ? integrationsQuery.eq('workspace_id', workspace)
+    : integrationsQuery.is('workspace_id', null)
+
+  let channelsQuery = supabase
+    .from('whatsapp_channel_configs')
+    .select(
+      'id, display_name, phone_number_id, waba_id, webhook_url, status, label, is_active, integration_id'
+    )
+  channelsQuery = workspace
+    ? channelsQuery.eq('workspace_id', workspace)
+    : channelsQuery.is('workspace_id', null)
+
+  const [intRes, chanRes] = await Promise.all([integrationsQuery, channelsQuery])
+  const integrations = (intRes.data as WhatsappIntegrationRow[] | null) || []
+  const channels = (chanRes.data as WhatsappChannelConfigRow[] | null) || []
+
+  const environments: WhatsappEnvironmentRow[] = []
+
+  for (const integration of integrations) {
+    let creds: Record<string, string> = {}
+    try {
+      const raw = await decrypt(integration.encrypted_credentials)
+      const parsed = JSON.parse(raw) as { credentials?: Record<string, string> }
+      creds = parsed.credentials || {}
+    } catch {
+      creds = {}
+    }
+
+    // Pair: prefer integration_id link; fall back to phone_number_id match.
+    const channel =
+      channels.find((c) => c.integration_id === integration.id) ||
+      channels.find((c) => c.phone_number_id === creds.phone_number_id) ||
+      null
+
+    environments.push({
+      integrationId: integration.id,
+      channelConfigId: channel?.id ?? null,
+      label: integration.label || channel?.label || channel?.display_name || 'Sem nome',
+      displayName: channel?.display_name || integration.label || 'WhatsApp',
+      phoneNumberId: channel?.phone_number_id || creds.phone_number_id || null,
+      wabaId: channel?.waba_id || creds.waba_id || null,
+      webhookUrl: channel?.webhook_url || null,
+      status: channel?.status || integration.status || 'draft',
+      isActive: Boolean(integration.is_active) && Boolean(channel?.is_active ?? true),
+      hasAccessToken: Boolean(creds.access_token),
+      hasAppSecret: Boolean(creds.app_secret),
+      verifyTokenPreview: maskVerifyToken(creds.verify_token),
+      maskedAccessToken: maskToken(creds.access_token),
+    })
+  }
+
+  return environments
+}
+
+export async function activateWhatsappEnvironment(
+  integrationId: string,
+  workspaceId?: string
+): Promise<void> {
+  const supabase = getServerSupabaseClient()
+  const workspace = getIntegrationWorkspaceId(workspaceId)
+
+  // Deactivate everyone first (within the same workspace), then activate the chosen one.
+  // We do this in two passes to avoid the partial unique-index conflict.
+  let deactivateQuery = supabase
+    .from('integrations')
+    .update({ is_active: false } as never)
+    .eq('provider', 'whatsapp')
+  deactivateQuery = workspace
+    ? deactivateQuery.eq('workspace_id', workspace)
+    : deactivateQuery.is('workspace_id', null)
+  await deactivateQuery
+
+  let deactivateChannels = supabase
+    .from('whatsapp_channel_configs')
+    .update({ is_active: false } as never)
+  deactivateChannels = workspace
+    ? deactivateChannels.eq('workspace_id', workspace)
+    : deactivateChannels.is('workspace_id', null)
+  await deactivateChannels
+
+  // Activate the chosen integration.
+  await supabase
+    .from('integrations')
+    .update({ is_active: true } as never)
+    .eq('id', integrationId)
+
+  // Find linked channel (by integration_id or by matching phone_number_id) and activate.
+  const { data: integrationRow } = (await supabase
+    .from('integrations')
+    .select('encrypted_credentials')
+    .eq('id', integrationId)
+    .maybeSingle()) as { data: { encrypted_credentials: string } | null }
+
+  if (!integrationRow) return
+
+  let phoneNumberId: string | null = null
+  try {
+    const raw = await decrypt(integrationRow.encrypted_credentials)
+    const parsed = JSON.parse(raw) as { credentials?: Record<string, string> }
+    phoneNumberId = parsed.credentials?.phone_number_id || null
+  } catch {
+    phoneNumberId = null
+  }
+
+  // Try linking by integration_id first.
+  const linkedByIntegration = await supabase
+    .from('whatsapp_channel_configs')
+    .update({ is_active: true } as never)
+    .eq('integration_id', integrationId)
+    .select('id')
+  const linkedRows = (linkedByIntegration.data as Array<{ id: string }> | null) || []
+
+  if (linkedRows.length === 0 && phoneNumberId) {
+    // Fall back to matching by phone_number_id.
+    await supabase
+      .from('whatsapp_channel_configs')
+      .update({ is_active: true, integration_id: integrationId } as never)
+      .eq('phone_number_id', phoneNumberId)
+  }
 }
 
 export async function saveValidatedIntegration(input: {
@@ -634,12 +855,59 @@ async function resolveAiProvider(
   }
 }
 
-export async function resolveWhatsAppRuntime(
+/**
+ * Internal helper: find the integration whose stored phone_number_id matches
+ * the requested one. Returns null if no match found.
+ */
+async function findWhatsappIntegrationByPhoneNumberId(
+  phoneNumberId: string,
   workspaceId?: string
+): Promise<StoredIntegrationPayload | null> {
+  const supabase = getServerSupabaseClient()
+  const workspace = getIntegrationWorkspaceId(workspaceId)
+  let query = supabase
+    .from('integrations')
+    .select('encrypted_credentials')
+    .eq('provider', 'whatsapp')
+  query = workspace ? query.eq('workspace_id', workspace) : query.is('workspace_id', null)
+  const { data } = (await query) as {
+    data: Array<{ encrypted_credentials: string }> | null
+  }
+  if (!data) return null
+
+  for (const row of data) {
+    try {
+      const decrypted = await decrypt(row.encrypted_credentials)
+      const parsed = JSON.parse(decrypted) as StoredIntegrationPayload
+      if (parsed.credentials?.phone_number_id?.trim() === phoneNumberId) {
+        return parsed
+      }
+    } catch {
+      continue
+    }
+  }
+  return null
+}
+
+export async function resolveWhatsAppRuntime(
+  workspaceId?: string,
+  /** When provided, pick credentials whose phone_number_id matches — used by the inbound webhook router to support multi-environment. */
+  inboundPhoneNumberId?: string
 ): Promise<ResolvedWhatsAppRuntime> {
-  const integration = await getDecryptedIntegration('whatsapp', workspaceId)
+  let integration: StoredIntegrationPayload | null = null
+
+  if (inboundPhoneNumberId) {
+    integration = await findWhatsappIntegrationByPhoneNumberId(inboundPhoneNumberId, workspaceId)
+  }
+  if (!integration) {
+    integration = await getDecryptedIntegration('whatsapp', workspaceId)
+  }
+
   const savedCredentials = integration?.credentials || {}
-  const channelConfig = await getWhatsappChannelConfig(workspaceId)
+  const channelConfig = inboundPhoneNumberId
+    ? (await getWhatsappChannelConfigByPhoneNumberId(inboundPhoneNumberId, workspaceId)) ||
+      (await getWhatsappChannelConfig(workspaceId))
+    : await getWhatsappChannelConfig(workspaceId)
 
   const accessToken = savedCredentials.access_token?.trim() || process.env.META_ACCESS_TOKEN || null
   const phoneNumberId =
@@ -685,17 +953,253 @@ export async function resolveWhatsAppRuntime(
   }
 }
 
-async function callOpenAiCompatibleProvider(input: {
-  provider: Exclude<AiProvider, 'anthropic'>
-  apiKey: string
-  model: string
-  temperature: number
+// =========================================================================
+// AI agent: two-pass architecture (classify → respond)
+//
+// The classify pass uses the cheapest model in the configured family to decide
+// intent, handoff and lead fields. The respond pass writes the customer-facing
+// reply only after the decision is made. Each pass uses strict JSON output
+// validated by zod; if validation fails we retry once before falling back to
+// the deterministic heuristic.
+// =========================================================================
+
+const INTENT_VALUES = [
+  'greeting',
+  'menu_question',
+  'pricing_question',
+  'opening_hours',
+  'location_question',
+  'reservation_interest',
+  'birthday_interest',
+  'kids_area_question',
+  'complaint',
+  'human_request',
+  'unclear',
+  'other',
+] as const
+
+const leadFieldsSchema = z.object({
+  partySize: z.number().int().min(1).max(200).nullable().optional().default(null),
+  desiredDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'desiredDate deve ser YYYY-MM-DD')
+    .nullable()
+    .optional()
+    .default(null),
+  desiredTime: z
+    .string()
+    .regex(/^\d{2}:\d{2}$/, 'desiredTime deve ser HH:MM')
+    .nullable()
+    .optional()
+    .default(null),
+  occasion: z.string().trim().max(80).nullable().optional().default(null),
+  customerNotes: z.string().trim().max(400).nullable().optional().default(null),
+})
+type ParsedLeadFields = z.infer<typeof leadFieldsSchema>
+
+const classifyOutputSchema = z.object({
+  intent: z.enum(INTENT_VALUES),
+  confidence: z.number().min(0).max(1),
+  shouldCreateLead: z.boolean(),
+  shouldHandoff: z.boolean(),
+  routeReason: z.string().trim().min(1).max(120),
+  leadSummary: z.string().trim().max(280).optional().default(''),
+  leadFields: leadFieldsSchema.optional().default({
+    partySize: null,
+    desiredDate: null,
+    desiredTime: null,
+    occasion: null,
+    customerNotes: null,
+  }),
+  knowledgeTopicsUsed: z.array(z.string().trim().max(120)).max(10).optional().default([]),
+})
+type ClassifyOutput = z.infer<typeof classifyOutputSchema>
+
+const responderOutputSchema = z.object({
+  reply: z.string().trim().min(1).max(2000),
+  citations: z.array(z.string()).max(8).optional().default([]),
+})
+type ResponderOutput = z.infer<typeof responderOutputSchema>
+
+function deriveMaxTokensForReply(agentProfile: AgentProfile | null) {
+  const maxChars = agentProfile?.max_response_chars ?? 420
+  // pt-BR averages ~3 chars per token; add headroom for JSON envelope + citations.
+  return Math.min(800, Math.max(180, Math.ceil(maxChars / 2.5) + 160))
+}
+
+const CLASSIFY_MAX_TOKENS = 400
+
+function buildClassifyPrompt(input: {
   settings: CrmSettings
   knowledgeMatches: KnowledgeMatch[]
-  agentProfile: AgentProfile | null
-  message: string
   conversationHistory: ConversationContextTurn[]
 }) {
+  const knowledgeTopics = input.knowledgeMatches.length
+    ? input.knowledgeMatches.map((match) => `- ${match.title} (${match.category})`).join('\n')
+    : '- (nenhum tópico relacionado encontrado na base)'
+
+  return [
+    `Você é um triador de mensagens para o atendimento da LLUM Pizzaria no WhatsApp. NÃO escreve resposta para o cliente — você apenas classifica.`,
+    `Contexto do negócio: ${input.settings.businessContext}`,
+    `Tópicos disponíveis na base de conhecimento publicada (use só para entender o domínio coberto, não copie):\n${knowledgeTopics}`,
+    `Histórico recente da conversa (mais antigo no topo). Considere antes de classificar:\n${buildConversationContextPrompt(
+      input.conversationHistory
+    )}`,
+    [
+      'Regras de classificação:',
+      `- "shouldHandoff": true quando o cliente pede humano, reclama, ou quando o intent é reservation_interest e já há dados suficientes (data + número de pessoas).`,
+      `- "shouldCreateLead": true só quando há sinal real de visita (reservation_interest, birthday_interest, ou perguntas comerciais com data/grupo).`,
+      `- "leadFields": preencha o que estiver explícito ou claramente inferível na mensagem ou no histórico. Use null quando o cliente NÃO informou. Não invente.`,
+      `- "desiredDate" sempre no formato YYYY-MM-DD; converta datas relativas (hoje, amanhã, sábado) a partir da data de hoje (${new Date()
+        .toISOString()
+        .slice(0, 10)}).`,
+      `- "desiredTime" sempre HH:MM (24h).`,
+      `- "occasion" é livre, máximo 80 chars (ex.: "aniversário 7 anos", "almoço família").`,
+      `- "knowledgeTopicsUsed": liste os títulos da base que são realmente relevantes para responder. Lista vazia se nada se aplica.`,
+    ].join('\n'),
+    [
+      'Responda SEMPRE com um único objeto JSON válido com EXATAMENTE estas chaves:',
+      '{',
+      `  "intent": "${INTENT_VALUES.join('"|"')}"`,
+      '  "confidence": number entre 0 e 1,',
+      '  "shouldCreateLead": boolean,',
+      '  "shouldHandoff": boolean,',
+      '  "routeReason": string curta com o motivo,',
+      '  "leadSummary": string com resumo de 1 linha do lead ou "",',
+      '  "leadFields": { "partySize": number|null, "desiredDate": "YYYY-MM-DD"|null, "desiredTime": "HH:MM"|null, "occasion": string|null, "customerNotes": string|null },',
+      '  "knowledgeTopicsUsed": string[]',
+      '}',
+      'Não inclua nada fora do JSON.',
+    ].join('\n'),
+  ]
+}
+
+function buildResponderPrompt(input: {
+  settings: CrmSettings
+  agentProfile: AgentProfile | null
+  knowledgeMatches: KnowledgeMatch[]
+  conversationHistory: ConversationContextTurn[]
+  classification: ClassifyOutput
+  availability?: AvailabilityResult | null
+}) {
+  const customPersona = input.agentProfile?.system_prompt?.trim()
+  const persona =
+    customPersona ||
+    `Você é ${input.settings.assistantName}, assistente da LLUM Pizzaria no WhatsApp. Tom: ${input.settings.tone}. Contexto: ${input.settings.businessContext}.`
+
+  const maxChars = input.agentProfile?.max_response_chars ?? 420
+
+  const guardrails = [
+    `Limite duro: a chave "reply" deve ter no máximo ${maxChars} caracteres.`,
+    'Use apenas a base de conhecimento abaixo como fonte factual. Se a base estiver vazia ou irrelevante para o que o cliente pediu, peça mais detalhes em vez de inventar.',
+    'Não repita informações já enviadas no histórico — continue a conversa.',
+    'Responda em português do Brasil, sem markdown, sem listas numeradas, no máximo 1 emoji, sem chamadas para link a não ser que esteja explicitamente na base.',
+    'Não cumprimente novamente se a conversa já está em andamento.',
+  ].join('\n- ')
+
+  const classifierSummary = [
+    `Decisão do triador (já tomada, NÃO refaça):`,
+    `- intent: ${input.classification.intent}`,
+    `- confidence: ${input.classification.confidence}`,
+    `- shouldHandoff: ${input.classification.shouldHandoff}`,
+    `- routeReason: ${input.classification.routeReason}`,
+    input.classification.leadFields.partySize
+      ? `- partySize já coletado: ${input.classification.leadFields.partySize}`
+      : null,
+    input.classification.leadFields.desiredDate
+      ? `- desiredDate já coletado: ${input.classification.leadFields.desiredDate}`
+      : null,
+    input.classification.leadFields.occasion
+      ? `- occasion já coletado: ${input.classification.leadFields.occasion}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+  const outputContract = [
+    'Responda APENAS com um JSON com estas chaves:',
+    '{',
+    '  "reply": string  // a mensagem literal a enviar para o cliente,',
+    '  "citations": string[]  // ids da base que sustentam a resposta (use os ids entre colchetes que aparecem em "Base de conhecimento publicada")',
+    '}',
+    'Não inclua nada fora do JSON. Não copie textualmente o conteúdo da base — sintetize.',
+  ].join('\n')
+
+  const availabilityBlock = input.availability
+    ? [
+        'Disponibilidade real consultada AGORA no sistema de reservas (use como fato — NÃO invente):',
+        `- data: ${input.availability.date}`,
+        `- status: ${input.availability.status}`,
+        input.availability.capacityLeft !== null
+          ? `- lugares livres: ${input.availability.capacityLeft} de ${input.availability.capacityMax}`
+          : null,
+        `- mensagem técnica: ${input.availability.message}`,
+        input.availability.alternatives.length > 0
+          ? `- datas alternativas próximas com vaga: ${input.availability.alternatives
+              .map((alt) => `${alt.date} (${alt.capacityLeft} livres)`)
+              .join(', ')}`
+          : null,
+        input.availability.status === 'full' || input.availability.status === 'blocked'
+          ? 'Informe ao cliente que a data está indisponível e ofereça as alternativas listadas acima.'
+          : input.availability.status === 'busy'
+            ? 'Avise que está com alta procura mas ainda há vagas — incentive confirmar logo.'
+            : input.availability.status === 'available'
+              ? 'Confirme a disponibilidade. Não prometa reserva — peça os dados para encaminhar ao link de reserva.'
+              : 'Não afirme disponibilidade — peça que o cliente confirme via link ou aguarde a equipe.',
+      ]
+        .filter(Boolean)
+        .join('\n')
+    : null
+
+  return [
+    persona,
+    `Diretrizes operacionais:\n- ${guardrails}`,
+    classifierSummary,
+    availabilityBlock,
+    `Base de conhecimento publicada (formato: [id] título (categoria) - trecho):\n${buildKnowledgePrompt(
+      input.knowledgeMatches
+    )}`,
+    `Histórico recente da conversa (mais antigo no topo). Continue a partir daqui:\n${buildConversationContextPrompt(
+      input.conversationHistory
+    )}`,
+    outputContract,
+  ].filter((block): block is string => Boolean(block))
+}
+
+type ResolvedProvider = NonNullable<Awaited<ReturnType<typeof resolveAiProvider>>>
+
+async function callProviderJson(input: {
+  provider: ResolvedProvider
+  systemPrompts: string[]
+  userMessage: string
+  maxTokens: number
+  temperature: number
+}): Promise<string | null> {
+  if (input.provider.provider === 'anthropic') {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': input.provider.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: input.provider.model,
+        max_tokens: input.maxTokens,
+        temperature: input.temperature,
+        system: input.systemPrompts.join('\n\n'),
+        messages: [{ role: 'user', content: input.userMessage }],
+      }),
+    })
+
+    if (!response.ok) return null
+    const data = await response.json()
+    const textBlock = Array.isArray(data.content)
+      ? data.content.find((item: { type?: string; text?: string }) => item?.type === 'text')
+      : null
+    return textBlock?.text || null
+  }
+
   const endpointByProvider: Record<Exclude<AiProvider, 'anthropic'>, string> = {
     openai: 'https://api.openai.com/v1/chat/completions',
     groq: 'https://api.groq.com/openai/v1/chat/completions',
@@ -705,40 +1209,25 @@ async function callOpenAiCompatibleProvider(input: {
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    Authorization: `Bearer ${input.apiKey}`,
+    Authorization: `Bearer ${input.provider.apiKey}`,
   }
 
-  if (input.provider === 'openrouter') {
+  if (input.provider.provider === 'openrouter') {
     headers['HTTP-Referer'] = 'https://llum.local'
     headers['X-Title'] = 'LLUM CRM IA'
   }
 
-  const response = await fetch(endpointByProvider[input.provider], {
+  const response = await fetch(endpointByProvider[input.provider.provider], {
     method: 'POST',
     headers,
     body: JSON.stringify({
-      model: input.model,
+      model: input.provider.model,
       temperature: input.temperature,
+      max_tokens: input.maxTokens,
       response_format: { type: 'json_object' },
       messages: [
-        {
-          role: 'system',
-          content: `VocÃª Ã© ${input.settings.assistantName}, assistente da LLUM Pizzaria. Responda em JSON com as chaves: intent, confidence, shouldCreateLead, shouldHandoff, reply, routeReason, leadSummary. Contexto: ${input.settings.businessContext}. Nunca invente preÃ§o ou disponibilidade.`,
-        },
-        {
-          role: 'system',
-          content: `Use a base publicada abaixo como fonte factual prioritÃ¡ria e nunca invente informaÃ§Ãµes:\n${buildKnowledgePrompt(
-            input.knowledgeMatches
-          )}`,
-        },
-        {
-          role: 'system',
-          content: `Considere o historico recente antes de responder. Preserve o contexto da conversa, inclusive o que ja foi respondido por humano ou IA, e responda de forma coerente com esse historico:\n${buildConversationContextPrompt(input.conversationHistory)}`,
-        },
-        ...(input.agentProfile?.system_prompt
-          ? [{ role: 'system' as const, content: input.agentProfile.system_prompt }]
-          : []),
-        { role: 'user', content: input.message },
+        ...input.systemPrompts.map((content) => ({ role: 'system' as const, content })),
+        { role: 'user', content: input.userMessage },
       ],
     }),
   })
@@ -748,121 +1237,88 @@ async function callOpenAiCompatibleProvider(input: {
   return data.choices?.[0]?.message?.content || null
 }
 
-async function callAnthropicProvider(input: {
-  apiKey: string
-  model: string
-  temperature: number
-  settings: CrmSettings
-  knowledgeMatches: KnowledgeMatch[]
-  agentProfile: AgentProfile | null
-  message: string
-  conversationHistory: ConversationContextTurn[]
-}) {
-  const systemParts = [
-    `VocÃª Ã© ${input.settings.assistantName}, assistente da LLUM Pizzaria. Responda em JSON com as chaves: intent, confidence, shouldCreateLead, shouldHandoff, reply, routeReason, leadSummary. Contexto: ${input.settings.businessContext}. Nunca invente preÃ§o ou disponibilidade.`,
-    `Use a base publicada abaixo como fonte factual prioritÃ¡ria e nunca invente informaÃ§Ãµes:\n${buildKnowledgePrompt(
-      input.knowledgeMatches
-    )}`,
-    `Considere o historico recente antes de responder. Preserve o contexto da conversa, inclusive o que ja foi respondido por humano ou IA, e responda de forma coerente com esse historico:\n${buildConversationContextPrompt(input.conversationHistory)}`,
-  ]
-
-  if (input.agentProfile?.system_prompt) {
-    systemParts.push(input.agentProfile.system_prompt)
+function safeJsonParse(content: string | null): unknown {
+  if (!content) return null
+  try {
+    return JSON.parse(content)
+  } catch {
+    // Some providers wrap JSON in code fences or prose. Extract the outermost object.
+    const match = content.match(/\{[\s\S]*\}/)
+    if (!match) return null
+    try {
+      return JSON.parse(match[0])
+    } catch {
+      return null
+    }
   }
-
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': input.apiKey,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: input.model,
-      max_tokens: 700,
-      temperature: input.temperature,
-      system: systemParts.join('\n\n'),
-      messages: [{ role: 'user', content: input.message }],
-    }),
-  })
-
-  if (!response.ok) return null
-  const data = await response.json()
-  const textBlock = Array.isArray(data.content)
-    ? data.content.find((item: { type?: string; text?: string }) => item?.type === 'text')
-    : null
-  return textBlock?.text || null
 }
 
-// Legacy classifier kept temporarily while the provider runtime is being migrated.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-async function classifyWithOpenAI(
-  message: string,
-  settings: CrmSettings,
-  knowledgeMatches: KnowledgeMatch[],
-  agentProfile: AgentProfile | null,
-  conversationHistory: ConversationContextTurn[],
-  workspaceId?: string
-): Promise<ClassificationResult | null> {
-  const resolvedProvider = await resolveAiProvider(workspaceId, agentProfile?.model)
-  if (!resolvedProvider) return null
+async function runClassifyPass(input: {
+  provider: ResolvedProvider
+  settings: CrmSettings
+  knowledgeMatches: KnowledgeMatch[]
+  conversationHistory: ConversationContextTurn[]
+  message: string
+  temperature: number
+}): Promise<ClassifyOutput | null> {
+  const systemPrompts = buildClassifyPrompt({
+    settings: input.settings,
+    knowledgeMatches: input.knowledgeMatches,
+    conversationHistory: input.conversationHistory,
+  })
 
-  try {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${resolvedProvider.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: resolvedProvider.model,
-        temperature: agentProfile?.temperature ?? 0.2,
-        response_format: { type: 'json_object' },
-        messages: [
-          {
-            role: 'system',
-            content: `Você é ${settings.assistantName}, assistente da LLUM Pizzaria. Responda em JSON com as chaves: intent, confidence, shouldCreateLead, shouldHandoff, reply, routeReason, leadSummary. Contexto: ${settings.businessContext}. Nunca invente preço ou disponibilidade.`,
-          },
-          {
-            role: 'system',
-            content: `Use a base publicada abaixo como fonte factual prioritária e nunca invente informações:\n${buildKnowledgePrompt(
-              knowledgeMatches
-            )}`,
-          },
-          {
-            role: 'system',
-            content: `Considere o historico recente antes de responder. Preserve o contexto da conversa, inclusive o que ja foi respondido por humano ou IA, e responda de forma coerente com esse historico:\n${buildConversationContextPrompt(conversationHistory)}`,
-          },
-          ...(agentProfile?.system_prompt
-            ? [{ role: 'system' as const, content: agentProfile.system_prompt }]
-            : []),
-          { role: 'user', content: message },
-        ],
-      }),
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const raw = await callProviderJson({
+      provider: input.provider,
+      systemPrompts,
+      userMessage: input.message,
+      maxTokens: CLASSIFY_MAX_TOKENS,
+      temperature: input.temperature,
     })
 
-    if (!response.ok) return null
-    const data = await response.json()
-    const content = data.choices?.[0]?.message?.content
-    if (!content) return null
-
-    const parsed = JSON.parse(content)
-    return {
-      intent: parsed.intent || 'other',
-      confidence: Number(parsed.confidence || 0.7),
-      shouldCreateLead: Boolean(parsed.shouldCreateLead),
-      shouldHandoff: Boolean(parsed.shouldHandoff),
-      reply: parsed.reply || FALLBACK_REPLY,
-      routeReason: parsed.routeReason || 'openai_classification',
-      leadSummary: parsed.leadSummary || undefined,
-      extractedData: parsed.extractedData || {},
-      source: 'openai',
-      knowledgeDocumentIds: knowledgeMatches.map((item) => item.id),
-      modelUsed: resolvedProvider.model,
-    }
-  } catch {
-    return null
+    const parsed = safeJsonParse(raw)
+    const result = classifyOutputSchema.safeParse(parsed)
+    if (result.success) return result.data
   }
+
+  return null
+}
+
+async function runResponderPass(input: {
+  provider: ResolvedProvider
+  settings: CrmSettings
+  agentProfile: AgentProfile | null
+  knowledgeMatches: KnowledgeMatch[]
+  conversationHistory: ConversationContextTurn[]
+  classification: ClassifyOutput
+  message: string
+  temperature: number
+  availability?: AvailabilityResult | null
+}): Promise<ResponderOutput | null> {
+  const systemPrompts = buildResponderPrompt({
+    settings: input.settings,
+    agentProfile: input.agentProfile,
+    knowledgeMatches: input.knowledgeMatches,
+    conversationHistory: input.conversationHistory,
+    classification: input.classification,
+    availability: input.availability,
+  })
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const raw = await callProviderJson({
+      provider: input.provider,
+      systemPrompts,
+      userMessage: input.message,
+      maxTokens: deriveMaxTokensForReply(input.agentProfile),
+      temperature: input.temperature,
+    })
+
+    const parsed = safeJsonParse(raw)
+    const result = responderOutputSchema.safeParse(parsed)
+    if (result.success) return result.data
+  }
+
+  return null
 }
 
 async function classifyWithConfiguredProvider(
@@ -876,52 +1332,107 @@ async function classifyWithConfiguredProvider(
   const resolvedProvider = await resolveAiProvider(workspaceId, agentProfile?.model)
   if (!resolvedProvider) return null
 
-  try {
-    const content =
-      resolvedProvider.provider === 'anthropic'
-        ? await callAnthropicProvider({
-            apiKey: resolvedProvider.apiKey,
-            model: resolvedProvider.model,
-            temperature: agentProfile?.temperature ?? 0.2,
-            settings,
-            knowledgeMatches,
-            agentProfile,
-            message,
-            conversationHistory,
-          })
-        : await callOpenAiCompatibleProvider({
-            provider: resolvedProvider.provider,
-            apiKey: resolvedProvider.apiKey,
-            model: resolvedProvider.model,
-            temperature: agentProfile?.temperature ?? 0.2,
-            settings,
-            knowledgeMatches,
-            agentProfile,
-            message,
-            conversationHistory,
-          })
+  const temperature = agentProfile?.temperature ?? 0.2
 
-    if (!content) return null
+  const classification = await runClassifyPass({
+    provider: resolvedProvider,
+    settings,
+    knowledgeMatches,
+    conversationHistory,
+    message,
+    temperature: Math.min(temperature, 0.2), // classifier should be near-deterministic
+  })
 
-    const parsed = JSON.parse(content)
-    return {
-      intent: parsed.intent || 'other',
-      confidence: Number(parsed.confidence || 0.7),
-      shouldCreateLead: Boolean(parsed.shouldCreateLead),
-      shouldHandoff: Boolean(parsed.shouldHandoff),
-      reply: parsed.reply || FALLBACK_REPLY,
-      routeReason:
-        parsed.routeReason ||
-        `${resolvedProvider.provider}_classification_${resolvedProvider.credentialSource}`,
-      leadSummary: parsed.leadSummary || undefined,
-      extractedData: parsed.extractedData || {},
-      source: 'provider',
-      knowledgeDocumentIds: knowledgeMatches.map((item) => item.id),
-      modelUsed: resolvedProvider.model,
-      providerUsed: resolvedProvider.provider,
+  if (!classification) return null
+
+  // Handoff for human request: use canned message, skip responder pass entirely.
+  const useCannedHandoffReply =
+    classification.shouldHandoff && classification.intent === 'human_request'
+
+  let replyText: string
+  let citations: string[] = []
+  let responderUsed = false
+
+  // Tool-call pré-emptivo: quando o classifier reconheceu uma data desejada
+  // para reserva, consultamos disponibilidade real ANTES do responder pass.
+  // O resultado vai como fato no prompt — a IA não pode mais inventar capacidade.
+  let availability: AvailabilityResult | null = null
+  const wantsReservation =
+    classification.intent === 'reservation_interest' ||
+    classification.intent === 'birthday_interest'
+  if (wantsReservation && classification.leadFields.desiredDate) {
+    try {
+      availability = await checkAvailability(
+        classification.leadFields.desiredDate,
+        classification.leadFields.partySize ?? null
+      )
+    } catch {
+      availability = null
     }
-  } catch {
-    return null
+  }
+
+  if (useCannedHandoffReply) {
+    replyText = settings.handoffMessage
+  } else {
+    const responder = await runResponderPass({
+      provider: resolvedProvider,
+      settings,
+      agentProfile,
+      knowledgeMatches,
+      conversationHistory,
+      classification,
+      message,
+      temperature,
+      availability,
+    })
+
+    if (!responder) return null
+    replyText = responder.reply
+    citations = responder.citations
+    responderUsed = true
+  }
+
+  // Citations from the responder are chunk ids it relied on; fall back to the
+  // full retrieval set when the model didn't tag any specific chunks.
+  const validCitationIds = citations.length
+    ? citations.filter((id) => knowledgeMatches.some((match) => match.id === id))
+    : []
+  const usedMatches = validCitationIds.length
+    ? knowledgeMatches.filter((m) => validCitationIds.includes(m.id))
+    : knowledgeMatches
+
+  const knowledgeDocumentIds = [...new Set(usedMatches.map((m) => m.documentId))]
+  const knowledgeChunkIds = usedMatches.map((m) => m.chunkId).filter((id): id is string => id !== null)
+
+  return {
+    intent: classification.intent,
+    confidence: classification.confidence,
+    shouldCreateLead: classification.shouldCreateLead,
+    shouldHandoff: classification.shouldHandoff,
+    reply: replyText,
+    routeReason: `${resolvedProvider.provider}_${classification.routeReason}${
+      responderUsed ? '' : '_canned_handoff'
+    }`,
+    leadSummary: classification.leadSummary || undefined,
+    extractedData: {
+      leadFields: classification.leadFields,
+      knowledgeTopicsUsed: classification.knowledgeTopicsUsed,
+      citationChunkIds: knowledgeChunkIds,
+      availability: availability
+        ? {
+            date: availability.date,
+            status: availability.status,
+            capacityLeft: availability.capacityLeft,
+            capacityMax: availability.capacityMax,
+            alternatives: availability.alternatives,
+          }
+        : null,
+    },
+    source: 'provider',
+    knowledgeDocumentIds,
+    knowledgeChunkIds,
+    modelUsed: resolvedProvider.model,
+    providerUsed: resolvedProvider.provider,
   }
 }
 
@@ -929,7 +1440,7 @@ function classifyHeuristically(
   message: string,
   settings: CrmSettings,
   conversationHistory: ConversationContextTurn[] = []
-): Omit<ClassificationResult, 'knowledgeDocumentIds' | 'modelUsed'> {
+): Omit<ClassificationResult, 'knowledgeDocumentIds' | 'knowledgeChunkIds' | 'modelUsed'> {
   const text = buildHeuristicSignalText(message, conversationHistory)
   const previousTurns = conversationHistory.slice(0, -1)
   const lastAssistantTurn = [...previousTurns]
@@ -1105,6 +1616,53 @@ function classifyHeuristically(
   }
 }
 
+function findRecentAssistantQuestion(history: ConversationContextTurn[]) {
+  return [...history]
+    .slice(-4)
+    .reverse()
+    .find(
+      (turn) =>
+        (turn.senderType === 'ai' || turn.senderType === 'human') &&
+        /\?\s*$/.test(turn.body.trim())
+    )
+}
+
+function gateTrivialMessage(
+  message: string,
+  history: ConversationContextTurn[],
+  settings: CrmSettings
+): Omit<ClassificationResult, 'knowledgeDocumentIds' | 'knowledgeChunkIds' | 'modelUsed'> | null {
+  if (!isShortAmbiguousMessage(message)) return null
+
+  // Affirmation handling already lives in classifyHeuristically — don't double-handle it.
+  if (isShortAffirmationMessage(message)) return null
+
+  const pendingQuestion = findRecentAssistantQuestion(history)
+  if (pendingQuestion) {
+    // The customer is replying to an open question, but with something we can't parse.
+    // Re-surface the question instead of generating a brand-new reply.
+    return {
+      intent: 'unclear',
+      confidence: 0.4,
+      shouldCreateLead: false,
+      shouldHandoff: false,
+      reply: `Para eu te ajudar direitinho, me confirma: ${pendingQuestion.body.trim()}`,
+      routeReason: 'trivial_reply_replays_question',
+      source: 'heuristic',
+    }
+  }
+
+  return {
+    intent: 'unclear',
+    confidence: 0.4,
+    shouldCreateLead: false,
+    shouldHandoff: false,
+    reply: `Oi! Eu sou o ${settings.assistantName} da LLUM. Posso te ajudar com cardápio, reservas, horários ou valores. O que você precisa?`,
+    routeReason: 'trivial_message_clarify',
+    source: 'heuristic',
+  }
+}
+
 async function classifyMessage(
   message: string,
   settings: CrmSettings,
@@ -1113,11 +1671,22 @@ async function classifyMessage(
   conversationHistory: ConversationContextTurn[],
   workspaceId?: string
 ) {
+  const trivialGate = gateTrivialMessage(message, conversationHistory, settings)
+  if (trivialGate) {
+    return {
+      ...trivialGate,
+      knowledgeDocumentIds: [],
+      knowledgeChunkIds: [],
+      modelUsed: 'trivial-gate',
+    }
+  }
+
   const heuristicResult = classifyHeuristically(message, settings, conversationHistory)
   if (heuristicResult.routeReason === 'reservation_affirmation_handoff') {
     return {
       ...heuristicResult,
-      knowledgeDocumentIds: knowledgeMatches.map((item) => item.id),
+      knowledgeDocumentIds: [...new Set(knowledgeMatches.map((m) => m.documentId))],
+      knowledgeChunkIds: knowledgeMatches.map((m) => m.chunkId).filter((id): id is string => id !== null),
       modelUsed: 'heuristic-router',
     }
   }
@@ -1134,7 +1703,8 @@ async function classifyMessage(
   return {
     ...heuristicResult,
     reply: buildKnowledgeAwareReply(heuristicResult.intent, knowledgeMatches) || heuristicResult.reply,
-    knowledgeDocumentIds: knowledgeMatches.map((item) => item.id),
+    knowledgeDocumentIds: [...new Set(knowledgeMatches.map((m) => m.documentId))],
+    knowledgeChunkIds: knowledgeMatches.map((m) => m.chunkId).filter((id): id is string => id !== null),
     modelUsed: 'heuristic-router',
   }
 }
@@ -1377,6 +1947,7 @@ async function createOrUpdateLead(params: {
   intent: string
   summary?: string
   score?: number
+  fields?: ParsedLeadFields | null
 }) {
   const supabase = getServerSupabaseClient()
   const { data: existing } = (await supabase
@@ -1388,19 +1959,47 @@ async function createOrUpdateLead(params: {
     .limit(1)
     .maybeSingle()) as { data: Lead | null }
 
+  const fields = params.fields ?? null
+
   if (existing) {
+    // Merge extracted fields without overwriting good data with null.
+    const mergedDesiredDate = fields?.desiredDate ?? existing.desired_date
+    const mergedDesiredTime = fields?.desiredTime ?? existing.desired_time
+    const mergedPartySize = fields?.partySize ?? existing.party_size
+    const mergedCustomerNotes =
+      fields?.customerNotes && fields.customerNotes.trim().length > 0
+        ? fields.customerNotes
+        : existing.customer_notes
+    const mergedMetadata: Record<string, Json> = {
+      ...(existing.metadata || {}),
+      ...(fields?.occasion ? { occasion: fields.occasion } : {}),
+    }
+
     await supabase
       .from('leads')
       .update({
         intent: params.intent,
         summary: params.summary || existing.summary,
         score: params.score ?? existing.score,
+        desired_date: mergedDesiredDate,
+        desired_time: mergedDesiredTime,
+        party_size: mergedPartySize,
+        customer_notes: mergedCustomerNotes,
+        metadata: mergedMetadata,
         last_message_at: nowIso(),
         updated_at: nowIso(),
       } as never)
       .eq('id', existing.id)
 
-    return { ...existing, intent: params.intent } as Lead
+    return {
+      ...existing,
+      intent: params.intent,
+      desired_date: mergedDesiredDate,
+      desired_time: mergedDesiredTime,
+      party_size: mergedPartySize,
+      customer_notes: mergedCustomerNotes,
+      metadata: mergedMetadata,
+    } as Lead
   }
 
   const payload = {
@@ -1411,12 +2010,12 @@ async function createOrUpdateLead(params: {
     intent: params.intent,
     score: params.score ?? 50,
     summary: params.summary || null,
-    desired_date: null,
-    desired_time: null,
-    party_size: null,
-    customer_notes: null,
+    desired_date: fields?.desiredDate ?? null,
+    desired_time: fields?.desiredTime ?? null,
+    party_size: fields?.partySize ?? null,
+    customer_notes: fields?.customerNotes ?? null,
     last_message_at: nowIso(),
-    metadata: {},
+    metadata: fields?.occasion ? { occasion: fields.occasion } : {},
   }
 
   const { data } = (await supabase
@@ -1583,15 +2182,46 @@ export async function processInboundMessage(input: {
   workspaceId?: string
   payload?: Record<string, unknown>
   source?: 'webhook' | 'diagnostic'
+  /** When set, the webhook_events row to update instead of inserting new ones. */
+  webhookEventId?: string | null
+  /** Inbound phone_number_id from Meta, used to pick the right environment. */
+  inboundPhoneNumberId?: string
 }) {
   const supabase = getServerSupabaseClient()
   const workspaceId = getWorkspaceId(input.workspaceId)
+  const t0 = Date.now()
   const [settings, agentProfile, knowledgeMatches, whatsappRuntime] = await Promise.all([
     getCrmSettings(workspaceId),
     getPrimaryAgentProfile(workspaceId),
     getKnowledgeMatches(input.body, workspaceId),
-    resolveWhatsAppRuntime(workspaceId),
+    resolveWhatsAppRuntime(workspaceId, input.inboundPhoneNumberId),
   ])
+  const retrievalLatencyMs = Date.now() - t0
+
+  const recordWebhookOutcome = async (
+    processing_result: string,
+    error: string | null = null
+  ) => {
+    if (input.webhookEventId) {
+      await supabase
+        .from('webhook_events')
+        .update({ processed: true, processing_result, error } as never)
+        .eq('id', input.webhookEventId)
+      return
+    }
+    await supabase.from('webhook_events').insert({
+      provider: 'meta',
+      event_type: 'message',
+      external_message_id: input.externalMessageId || `local-${randomUUID()}`,
+      phone_number_id: whatsappRuntime.phoneNumberId,
+      wa_id: input.phone,
+      payload: input.payload || {},
+      signature_valid: true,
+      processed: true,
+      processing_result,
+      error,
+    } as never)
+  }
 
   if (input.externalMessageId) {
     const { data: duplicate } = (await supabase
@@ -1601,19 +2231,7 @@ export async function processInboundMessage(input: {
       .maybeSingle()) as { data: Pick<Interaction, 'id' | 'conversation_id'> | null }
 
     if (duplicate) {
-      await supabase.from('webhook_events').insert({
-        provider: 'meta',
-        event_type: 'message',
-        external_message_id: input.externalMessageId,
-        phone_number_id: whatsappRuntime.phoneNumberId,
-        wa_id: input.phone,
-        payload: input.payload || {},
-        signature_valid: true,
-        processed: true,
-        processing_result: 'duplicate_ignored',
-        error: null,
-      } as never)
-
+      await recordWebhookOutcome('duplicate_ignored')
       return { duplicate: true, conversationId: duplicate.conversation_id }
     }
   }
@@ -1629,6 +2247,7 @@ export async function processInboundMessage(input: {
   })
   const conversationHistory = await getConversationHistory(conversation.id)
 
+  const classifyStart = Date.now()
   const classification = await classifyMessage(
     input.body,
     settings,
@@ -1637,6 +2256,7 @@ export async function processInboundMessage(input: {
     conversationHistory,
     workspaceId
   )
+  const classifyLatencyMs = Date.now() - classifyStart
 
   const agentRun = await createAgentRun({
     conversation_id: conversation.id,
@@ -1654,13 +2274,20 @@ export async function processInboundMessage(input: {
         created_at: turn.createdAt,
       })) as unknown as Json,
       knowledge_document_ids: classification.knowledgeDocumentIds,
+      knowledge_chunk_ids: classification.knowledgeChunkIds,
       knowledge_titles: knowledgeMatches.map((item) => item.title),
     },
-    output: classification as unknown as Record<string, Json>,
+    output: {
+      ...(classification as unknown as Record<string, Json>),
+      stage_latency_ms: {
+        retrieval: retrievalLatencyMs,
+        classify_and_generate: classifyLatencyMs,
+      } as unknown as Json,
+    },
     intent: classification.intent,
     status: 'success',
     error: null,
-    latency_ms: classification.source === 'heuristic' ? 50 : 900,
+    latency_ms: retrievalLatencyMs + classifyLatencyMs,
     cost_estimate: null,
     route_reason: classification.routeReason,
     delegation_result: classification.shouldHandoff ? 'handoff_requested' : 'handled_by_crm_ai',
@@ -1670,12 +2297,24 @@ export async function processInboundMessage(input: {
   let handoff: Handoff | null = null
 
   if (classification.shouldCreateLead) {
+    const extractedFields =
+      (classification.extractedData?.leadFields as ParsedLeadFields | undefined) || null
+
+    // Score derived from how much structured data we already have. Reservation
+    // interest with date+party is hot; bare interest without data stays warm.
+    let derivedScore = classification.intent === 'reservation_interest' ? 70 : 50
+    if (extractedFields?.desiredDate) derivedScore += 10
+    if (extractedFields?.partySize) derivedScore += 10
+    if (extractedFields?.occasion) derivedScore += 5
+    derivedScore = Math.min(derivedScore, 95)
+
     lead = await createOrUpdateLead({
       customerId: customer.id,
       conversationId: conversation.id,
       intent: classification.intent,
       summary: classification.leadSummary,
-      score: classification.intent === 'reservation_interest' ? 85 : 55,
+      score: derivedScore,
+      fields: extractedFields,
     })
   }
 
@@ -1704,8 +2343,12 @@ export async function processInboundMessage(input: {
       conversation.status !== 'handoff_requested'
 
     if (shouldSendHandoffReply) {
+      const handoffMaxChars = agentProfile?.max_response_chars ?? 420
       const formattedHandoffReply = formatAgentReplyBlocks(
-        classification.reply || settings.handoffMessage
+        truncateReplyToLimit(
+          classification.reply || settings.handoffMessage,
+          handoffMaxChars
+        )
       )
 
       const outbound = await createOutboundInteraction({
@@ -1716,6 +2359,7 @@ export async function processInboundMessage(input: {
         metadata: {
           mode: 'handoff',
           knowledge_document_ids: classification.knowledgeDocumentIds,
+          knowledge_chunk_ids: classification.knowledgeChunkIds,
         },
       })
 
@@ -1732,18 +2376,10 @@ export async function processInboundMessage(input: {
         last_message_preview: outbound.body,
       })
 
-      await supabase.from('webhook_events').insert({
-        provider: 'meta',
-        event_type: 'message',
-        external_message_id: input.externalMessageId || `local-${randomUUID()}`,
-        phone_number_id: whatsappRuntime.phoneNumberId,
-        wa_id: customer.phone,
-        payload: input.payload || {},
-        signature_valid: true,
-        processed: true,
-        processing_result: sendResult.sendStatus === 'failed' ? 'handoff_reply_failed' : 'handoff_requested',
-        error: sendResult.error,
-      } as never)
+      await recordWebhookOutcome(
+        sendResult.sendStatus === 'failed' ? 'handoff_reply_failed' : 'handoff_requested',
+        sendResult.error
+      )
     }
 
     if (conversation.status === 'human_active') {
@@ -1765,7 +2401,10 @@ export async function processInboundMessage(input: {
       await syncOpenHandoffForConversation(conversation.id, 'release_to_ai')
     }
 
-    const formattedReply = formatAgentReplyBlocks(classification.reply)
+    const replyMaxChars = agentProfile?.max_response_chars ?? 420
+    const formattedReply = formatAgentReplyBlocks(
+      truncateReplyToLimit(classification.reply, replyMaxChars)
+    )
 
     const outbound = await createOutboundInteraction({
       conversationId: conversation.id,
@@ -1775,6 +2414,7 @@ export async function processInboundMessage(input: {
       metadata: {
         source: classification.source,
         knowledge_document_ids: classification.knowledgeDocumentIds,
+        knowledge_chunk_ids: classification.knowledgeChunkIds,
       },
     })
 
@@ -1794,18 +2434,10 @@ export async function processInboundMessage(input: {
       updated_at: nowIso(),
     })
 
-    await supabase.from('webhook_events').insert({
-      provider: 'meta',
-      event_type: 'message',
-      external_message_id: input.externalMessageId || `local-${randomUUID()}`,
-      phone_number_id: whatsappRuntime.phoneNumberId,
-      wa_id: customer.phone,
-      payload: input.payload || {},
-      signature_valid: true,
-      processed: true,
-      processing_result: sendResult.sendStatus === 'failed' ? 'reply_failed' : 'handled_by_crm_ai',
-      error: sendResult.error,
-    } as never)
+    await recordWebhookOutcome(
+      sendResult.sendStatus === 'failed' ? 'reply_failed' : 'handled_by_crm_ai',
+      sendResult.error
+    )
   }
 
   return { customer, conversation, inbound, lead, handoff, agentRun }
@@ -1896,12 +2528,40 @@ export async function sendManualReply(conversationId: string, body: string) {
   const customer = conversation.customers
   if (!customer) throw new Error('Cliente não encontrado')
 
+  // Detect whether the last outbound from the AI exists and the human is now
+  // overriding it. We use this signal in telemetry to grade reply quality.
+  const supabase = getServerSupabaseClient()
+  const { data: lastAiOutbound } = (await supabase
+    .from('interactions')
+    .select('id, created_at')
+    .eq('conversation_id', conversationId)
+    .eq('direction', 'outbound')
+    .eq('sender_type', 'ai')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()) as { data: { id: string; created_at: string } | null }
+
+  const lastInboundAt = detail.messages
+    .filter((m) => m.direction === 'inbound')
+    .at(-1)?.created_at
+
+  // Override = AI replied AFTER the last customer message AND a human is now
+  // typing a different response. Without an inbound, the human is just
+  // sending a proactive message.
+  const overrodeAiReply = Boolean(
+    lastAiOutbound && lastInboundAt && lastAiOutbound.created_at > lastInboundAt
+  )
+
   const outbound = await createOutboundInteraction({
     conversationId,
     customerId: customer.id,
     body,
     senderType: 'human',
-    metadata: { source: 'manual_reply' },
+    metadata: {
+      source: 'manual_reply',
+      human_overrode_reply: overrodeAiReply,
+      overridden_ai_interaction_id: overrodeAiReply ? lastAiOutbound?.id ?? null : null,
+    },
   })
 
   const sendResult = await sendWhatsAppMessage({

@@ -1,6 +1,13 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
+import { after } from 'next/server'
 import { processInboundMessage, resolveWhatsAppRuntime } from '@/lib/crm'
+import { getServerSupabaseClient } from '@/lib/server/supabase'
+import type { WebhookEvent } from '@/types/database'
+
+// Allow the background `after()` task to keep running for up to 60s after
+// we respond 200. The webhook itself targets <200ms response time.
+export const maxDuration = 60
 
 function validateSignature(requestBody: string, signatureHeader: string | null, appSecret: string | null) {
   if (!appSecret || !signatureHeader) return false
@@ -28,7 +35,29 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   const rawBody = await request.text()
-  const runtime = await resolveWhatsAppRuntime()
+
+  let payload: Record<string, unknown> = {}
+  try {
+    payload = JSON.parse(rawBody) as Record<string, unknown>
+  } catch {
+    return NextResponse.json({ ok: true, ignored: 'invalid_json' })
+  }
+
+  const entry = (payload.entry as Array<Record<string, unknown>> | undefined)?.[0]
+  const changes = (entry?.changes as Array<Record<string, unknown>> | undefined)?.[0]
+  const value = changes?.value as Record<string, unknown> | undefined
+  const metadata = value?.metadata as { phone_number_id?: string } | undefined
+  const message = (value?.messages as Array<Record<string, unknown>> | undefined)?.[0] as
+    | { id?: string; text?: { body?: string } }
+    | undefined
+  const contact = (value?.contacts as Array<Record<string, unknown>> | undefined)?.[0] as
+    | { profile?: { name?: string }; wa_id?: string }
+    | undefined
+
+  // Use the inbound phone_number_id (from Meta's metadata) to select the right
+  // environment's credentials — supports running production + test side by side.
+  const inboundPhoneNumberId = metadata?.phone_number_id?.trim() || undefined
+  const runtime = await resolveWhatsAppRuntime(undefined, inboundPhoneNumberId)
   const signature = request.headers.get('x-hub-signature-256')
   const signatureValid = validateSignature(rawBody, signature, runtime.appSecret)
 
@@ -36,27 +65,61 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Invalid webhook signature' }, { status: 401 })
   }
 
-  const payload = JSON.parse(rawBody)
-  const entry = payload.entry?.[0]
-  const changes = entry?.changes?.[0]
-  const value = changes?.value
-  const message = value?.messages?.[0]
-  const contact = value?.contacts?.[0]
-
-  if (!message || !contact) {
+  if (!message || !contact || !contact.wa_id) {
     return NextResponse.json({ ok: true, ignored: true })
   }
 
   const body = message.text?.body || '[mensagem sem texto]'
 
-  const result = await processInboundMessage({
-    customerName: contact.profile?.name || contact.wa_id,
-    phone: contact.wa_id,
-    body,
-    externalMessageId: message.id,
-    source: 'webhook',
-    payload,
+  // 1. Persist webhook event immediately so we have an audit row even if
+  //    processing fails or times out. processed=false marks it for retry.
+  const supabase = getServerSupabaseClient()
+  const insertResult = (await supabase
+    .from('webhook_events')
+    .insert({
+      provider: 'meta',
+      event_type: 'message',
+      external_message_id: message.id ?? null,
+      phone_number_id: inboundPhoneNumberId || runtime.phoneNumberId,
+      wa_id: contact.wa_id,
+      payload,
+      signature_valid: signatureValid,
+      processed: false,
+      processing_result: 'pending',
+      error: null,
+    } as never)
+    .select('id')
+    .single()) as { data: Pick<WebhookEvent, 'id'> | null }
+
+  const webhookEventId = insertResult.data?.id ?? null
+
+  // 2. Schedule background processing. Returns 200 immediately to Meta.
+  after(async () => {
+    try {
+      await processInboundMessage({
+        customerName: contact.profile?.name || contact.wa_id!,
+        phone: contact.wa_id!,
+        body,
+        externalMessageId: message.id ?? null,
+        source: 'webhook',
+        payload,
+        webhookEventId,
+        inboundPhoneNumberId,
+      })
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      if (webhookEventId) {
+        await supabase
+          .from('webhook_events')
+          .update({
+            processed: true,
+            processing_result: 'error',
+            error: errMsg,
+          } as never)
+          .eq('id', webhookEventId)
+      }
+    }
   })
 
-  return NextResponse.json({ ok: true, signatureValid, result })
+  return NextResponse.json({ ok: true, signatureValid, queued: webhookEventId })
 }

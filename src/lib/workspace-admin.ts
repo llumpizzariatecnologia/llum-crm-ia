@@ -359,12 +359,38 @@ export async function deleteKnowledgeDocument(documentId: string, workspaceId?: 
 
 export async function getWhatsappChannelConfig(workspaceId?: string) {
   const supabase = getServerSupabaseClient()
+  // Prefer the active row; falls back to the only row when no `is_active` flag
+  // has been set yet (pre-migration state).
   const { data, error } = await supabase
     .from('whatsapp_channel_configs')
     .select('*')
     .eq('workspace_id', getWorkspaceId(workspaceId))
+    .order('is_active', { ascending: false })
+    .limit(1)
     .maybeSingle()
 
+  if (error) return null
+  return (data as WhatsappChannelConfig | null) || null
+}
+
+/**
+ * Look up a channel config by inbound phone_number_id. Used by the webhook
+ * router so inbound messages still route correctly even when the "active"
+ * config is a different environment.
+ */
+export async function getWhatsappChannelConfigByPhoneNumberId(
+  phoneNumberId: string,
+  workspaceId?: string
+) {
+  const supabase = getServerSupabaseClient()
+  let query = supabase
+    .from('whatsapp_channel_configs')
+    .select('*')
+    .eq('phone_number_id', phoneNumberId)
+  if (workspaceId) {
+    query = query.eq('workspace_id', getWorkspaceId(workspaceId))
+  }
+  const { data, error } = await query.limit(1).maybeSingle()
   if (error) return null
   return (data as WhatsappChannelConfig | null) || null
 }
@@ -375,8 +401,7 @@ export async function saveWhatsappChannelConfig(
 ) {
   const supabase = getServerSupabaseClient()
   const workspace = getWorkspaceId(workspaceId)
-  const existingConfig =
-    input.id ? null : await getWhatsappChannelConfig(workspace)
+  const timestamp = nowIso()
 
   const row = {
     workspace_id: workspace,
@@ -391,29 +416,14 @@ export async function saveWhatsappChannelConfig(
     max_message_chars: input.maxMessageChars,
     split_message_delay_seconds: input.splitMessageDelaySeconds,
     status: input.status,
-    connected_at: input.status === 'connected' ? nowIso() : null,
-    last_healthcheck_at: nowIso(),
-    updated_at: nowIso(),
-  }
-
-  if (input.id || existingConfig?.id) {
-    const { data, error } = await supabase
-      .from('whatsapp_channel_configs')
-      .update(row as never)
-      .eq('id', input.id || existingConfig?.id || '')
-      .select('*')
-      .single()
-
-    if (error) throw new Error(error.message)
-    return data as WhatsappChannelConfig
+    connected_at: input.status === 'connected' ? timestamp : null,
+    last_healthcheck_at: timestamp,
+    updated_at: timestamp,
   }
 
   const { data, error } = await supabase
     .from('whatsapp_channel_configs')
-    .insert({
-      ...row,
-      created_at: nowIso(),
-    } as never)
+    .upsert(row as never, { onConflict: 'workspace_id' })
     .select('*')
     .single()
 
