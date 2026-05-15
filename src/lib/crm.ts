@@ -675,24 +675,26 @@ export async function listWhatsappEnvironments(
   workspaceId?: string
 ): Promise<WhatsappEnvironmentRow[]> {
   const supabase = getServerSupabaseClient()
-  const workspace = getIntegrationWorkspaceId(workspaceId)
+  // integrations.workspace_id is a uuid (NULL for the global tenant), but
+  // whatsapp_channel_configs.workspace_id is a text slug like 'llum-default'.
+  // We have to query each table with its own convention.
+  const integrationWorkspace = getIntegrationWorkspaceId(workspaceId)
+  const channelWorkspace = getWorkspaceId(workspaceId)
 
   let integrationsQuery = supabase
     .from('integrations')
     .select('id, label, is_active, encrypted_credentials, status')
     .eq('provider', 'whatsapp')
-  integrationsQuery = workspace
-    ? integrationsQuery.eq('workspace_id', workspace)
+  integrationsQuery = integrationWorkspace
+    ? integrationsQuery.eq('workspace_id', integrationWorkspace)
     : integrationsQuery.is('workspace_id', null)
 
-  let channelsQuery = supabase
+  const channelsQuery = supabase
     .from('whatsapp_channel_configs')
     .select(
       'id, display_name, phone_number_id, waba_id, webhook_url, status, label, is_active, integration_id'
     )
-  channelsQuery = workspace
-    ? channelsQuery.eq('workspace_id', workspace)
-    : channelsQuery.is('workspace_id', null)
+    .eq('workspace_id', channelWorkspace)
 
   const [intRes, chanRes] = await Promise.all([integrationsQuery, channelsQuery])
   const integrations = (intRes.data as WhatsappIntegrationRow[] | null) || []
@@ -741,26 +743,25 @@ export async function activateWhatsappEnvironment(
   workspaceId?: string
 ): Promise<void> {
   const supabase = getServerSupabaseClient()
-  const workspace = getIntegrationWorkspaceId(workspaceId)
+  // integrations uses uuid workspace_id (NULL for global); channels use a
+  // text slug like 'llum-default'. We deactivate everyone in this workspace
+  // first to avoid colliding with the partial unique-index on is_active=true.
+  const integrationWorkspace = getIntegrationWorkspaceId(workspaceId)
+  const channelWorkspace = getWorkspaceId(workspaceId)
 
-  // Deactivate everyone first (within the same workspace), then activate the chosen one.
-  // We do this in two passes to avoid the partial unique-index conflict.
   let deactivateQuery = supabase
     .from('integrations')
     .update({ is_active: false } as never)
     .eq('provider', 'whatsapp')
-  deactivateQuery = workspace
-    ? deactivateQuery.eq('workspace_id', workspace)
+  deactivateQuery = integrationWorkspace
+    ? deactivateQuery.eq('workspace_id', integrationWorkspace)
     : deactivateQuery.is('workspace_id', null)
   await deactivateQuery
 
-  let deactivateChannels = supabase
+  await supabase
     .from('whatsapp_channel_configs')
     .update({ is_active: false } as never)
-  deactivateChannels = workspace
-    ? deactivateChannels.eq('workspace_id', workspace)
-    : deactivateChannels.is('workspace_id', null)
-  await deactivateChannels
+    .eq('workspace_id', channelWorkspace)
 
   // Activate the chosen integration.
   await supabase
