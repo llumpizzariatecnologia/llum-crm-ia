@@ -1596,7 +1596,7 @@ function classifyHeuristically(
       confidence: 0.95,
       shouldCreateLead: false,
       shouldHandoff: false,
-      reply: `Opa! Eu sou o ${settings.assistantName} da LLUM. Posso te ajudar com cardápio, reservas, horários, valores ou chamar um atendente.`,
+      reply: `Opa! Aqui é a ${settings.assistantName}, do atendimento da LLUM. Posso te ajudar com reservas, valores, cardápio ou tirar qualquer dúvida — me conta o que você precisa? 😊`,
       routeReason: 'greeting',
       source: 'heuristic',
     }
@@ -1654,7 +1654,7 @@ function gateTrivialMessage(
     confidence: 0.4,
     shouldCreateLead: false,
     shouldHandoff: false,
-    reply: `Oi! Eu sou o ${settings.assistantName} da LLUM. Posso te ajudar com cardápio, reservas, horários ou valores. O que você precisa?`,
+    reply: `Oi 😊 aqui é a ${settings.assistantName}, do atendimento da LLUM. Como posso te ajudar hoje? Se quiser saber sobre reservas, valores, cardápio ou nossa experiência pra famílias, é só me dizer!`,
     routeReason: 'trivial_message_clarify',
     source: 'heuristic',
   }
