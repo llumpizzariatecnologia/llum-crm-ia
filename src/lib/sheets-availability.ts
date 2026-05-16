@@ -1,6 +1,7 @@
 import 'server-only'
 
 import type { AvailabilityResult, AvailabilityStatus } from '@/lib/reservations'
+import { getTodayBrazilDate } from '@/lib/reservations'
 
 // Default capacity matches the LLUM production house cap. Override via env if
 // future Saturdays or special dates ever differ.
@@ -159,6 +160,10 @@ export async function checkAvailabilityViaSheets(
   date: string,
   partySize: number | null
 ): Promise<AvailabilityResult> {
+  const today = getTodayBrazilDate()
+  const isToday = date === today
+  const isPast = date < today
+
   const sheetId = process.env.AVAILABILITY_SHEET_ID
   if (!sheetId) {
     return {
@@ -169,6 +174,8 @@ export async function checkAvailabilityViaSheets(
       capacityMax: null,
       booked: null,
       message: 'AVAILABILITY_SHEET_ID não configurado.',
+      isToday,
+      isPast,
       alternatives: [],
     }
   }
@@ -182,6 +189,8 @@ export async function checkAvailabilityViaSheets(
       capacityMax: null,
       booked: null,
       message: 'Data inválida.',
+      isToday,
+      isPast,
       alternatives: [],
     }
   }
@@ -198,6 +207,8 @@ export async function checkAvailabilityViaSheets(
       capacityMax: null,
       booked: null,
       message: `Sistema de reservas indisponível: ${err instanceof Error ? err.message : 'erro desconhecido'}`,
+      isToday,
+      isPast,
       alternatives: [],
     }
   }
@@ -207,22 +218,25 @@ export async function checkAvailabilityViaSheets(
   const left = Math.max(0, max - booked)
   const status = statusFor(booked, max, partySize)
 
-  // Suggest alternative dates within ±3 days when the target is unavailable.
+  // Suggest alternative dates ONLY in the future when the target is full.
+  // Never suggest past dates, and skip alternatives entirely when the requested
+  // date itself is in the past or today (today-full is handled by the prompt,
+  // not by alt suggestions).
   const alternatives: AvailabilityResult['alternatives'] = []
-  if (status === 'full') {
+  if (!isPast && !isToday && status === 'full') {
     const target = new Date(`${date}T12:00:00`)
-    for (let offset = 1; offset <= 3 && alternatives.length < 4; offset += 1) {
-      for (const sign of [-1, 1] as const) {
-        const d = new Date(target)
-        d.setUTCDate(d.getUTCDate() + sign * offset)
-        const altIso = formatIsoDate(d)
-        const altMax = capacityFor(altIso)
-        const altBooked = bookedByDate.get(altIso) || 0
-        const altLeft = altMax - altBooked
-        const altStatus = statusFor(altBooked, altMax, partySize)
-        if (altStatus === 'available' || altStatus === 'busy') {
-          alternatives.push({ date: altIso, status: altStatus, capacityLeft: altLeft })
-        }
+    // Search forward up to 7 days (always future of `today`)
+    for (let offset = 1; offset <= 7 && alternatives.length < 4; offset += 1) {
+      const d = new Date(target)
+      d.setUTCDate(d.getUTCDate() + offset)
+      const altIso = formatIsoDate(d)
+      if (altIso <= today) continue
+      const altMax = capacityFor(altIso)
+      const altBooked = bookedByDate.get(altIso) || 0
+      const altLeft = altMax - altBooked
+      const altStatus = statusFor(altBooked, altMax, partySize)
+      if (altStatus === 'available' || altStatus === 'busy') {
+        alternatives.push({ date: altIso, status: altStatus, capacityLeft: altLeft })
       }
     }
   }
@@ -235,6 +249,8 @@ export async function checkAvailabilityViaSheets(
     capacityMax: max,
     booked,
     message: buildMessage(status, date, booked, max, left),
+    isToday,
+    isPast,
     alternatives: alternatives.slice(0, 4),
   }
 }

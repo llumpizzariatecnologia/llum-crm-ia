@@ -12,7 +12,11 @@ export type AvailabilityResult = {
   capacityMax: number | null
   booked: number | null
   message: string
-  /** Suggested alternative dates near the requested one when status is full/blocked. */
+  /** True when the requested date IS today (Brazil time). */
+  isToday: boolean
+  /** True when the requested date is already in the past. */
+  isPast: boolean
+  /** Suggested alternative dates near the requested one when status is full/blocked. Only future dates (>= today). */
   alternatives: Array<{ date: string; status: AvailabilityStatus; capacityLeft: number }>
 }
 
@@ -53,10 +57,29 @@ function formatDate(d: Date): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
 }
 
+/**
+ * Today's date in América/São_Paulo (LLUM is in Curitiba, UTC-3). Returns
+ * YYYY-MM-DD. Used for isToday/isPast classification — local Brazilian day
+ * matters more than UTC day for restaurant operations.
+ */
+export function getTodayBrazilDate(): string {
+  // en-CA's date format is YYYY-MM-DD, which Intl outputs cleanly.
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date())
+}
+
 export async function checkAvailability(
   date: string,
   partySize: number | null
 ): Promise<AvailabilityResult> {
+  const today = getTodayBrazilDate()
+  const isToday = date === today
+  const isPast = date < today
+
   const target = parseDate(date)
   if (!target) {
     return {
@@ -67,6 +90,8 @@ export async function checkAvailability(
       capacityMax: null,
       booked: null,
       message: 'Data inválida.',
+      isToday,
+      isPast,
       alternatives: [],
     }
   }
@@ -81,6 +106,8 @@ export async function checkAvailability(
       capacityMax: null,
       booked: null,
       message: 'Sistema de reservas indisponível.',
+      isToday,
+      isPast,
       alternatives: [],
     }
   }
@@ -134,17 +161,20 @@ export async function checkAvailability(
 
   const targetResult = computeForDate(target)
 
-  // Gather alternatives only when the target is unavailable.
+  // Gather alternatives only when the target is unavailable AND it isn't a
+  // past date (no point suggesting alternatives to a date that already passed).
+  // Alternatives must be in the future — never suggest a date already gone.
   const alternatives: AvailabilityResult['alternatives'] = []
-  if (targetResult.status === 'full' || targetResult.status === 'blocked') {
-    for (let offset = 1; offset <= 3; offset += 1) {
-      for (const sign of [-1, 1]) {
-        const d = new Date(target)
-        d.setUTCDate(d.getUTCDate() + sign * offset)
-        const alt = computeForDate(d)
-        if (alt.status === 'available' || alt.status === 'busy') {
-          alternatives.push({ date: alt.key, status: alt.status, capacityLeft: alt.left })
-        }
+  if (!isPast && (targetResult.status === 'full' || targetResult.status === 'blocked')) {
+    // Search forward up to 7 days (only future, never past)
+    for (let offset = 1; offset <= 7 && alternatives.length < 4; offset += 1) {
+      const d = new Date(target)
+      d.setUTCDate(d.getUTCDate() + offset)
+      const altKey = formatDate(d)
+      if (altKey <= today) continue // never suggest today or past
+      const alt = computeForDate(d)
+      if (alt.status === 'available' || alt.status === 'busy') {
+        alternatives.push({ date: alt.key, status: alt.status, capacityLeft: alt.left })
       }
     }
   }
@@ -172,6 +202,8 @@ export async function checkAvailability(
     capacityMax: targetResult.max,
     booked: targetResult.booked,
     message,
+    isToday,
+    isPast,
     alternatives: alternatives.slice(0, 4),
   }
 }

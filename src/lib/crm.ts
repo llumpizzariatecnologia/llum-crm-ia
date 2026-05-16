@@ -17,6 +17,7 @@ import {
 } from '@/lib/workspace-admin'
 import { searchKnowledgeMatches, type KnowledgeMatch } from '@/lib/knowledge-rag'
 import { checkAvailability, type AvailabilityResult } from '@/lib/availability'
+import { getTodayBrazilDate } from '@/lib/reservations'
 import type {
   AgentRun,
   AgentProfile,
@@ -1126,27 +1127,52 @@ function buildResponderPrompt(input: {
     'Não inclua nada fora do JSON. Não copie textualmente o conteúdo da base — sintetize.',
   ].join('\n')
 
-  const availabilityBlock = input.availability
+  const todayBrazil = getTodayBrazilDate()
+  const av = input.availability
+  const guidance = (() => {
+    if (!av) return null
+    if (av.isPast) {
+      return 'A data pedida JÁ PASSOU. Não responda como se fosse possível reservar. Pergunte se o cliente quer planejar uma nova data e ofereça ajuda pra escolher.'
+    }
+    if (av.isToday && (av.status === 'full' || av.status === 'blocked')) {
+      return 'É HOJE e a reserva está esgotada/casa fechada. NÃO sugira datas alternativas distantes — o cliente claramente quer vir hoje. Diga que pra hoje a reserva está esgotada, mas que será uma alegria receber a família — o cliente pode tentar vir presencialmente (ordem de chegada, sujeito à disponibilidade no momento, sem garantia de mesa grande ou acomodação conjunta para grupos). Se ele quiser planejar pra outro dia, aí sim sugira opções.'
+    }
+    if (av.isToday && av.status === 'busy') {
+      return 'É HOJE e a casa está com alta procura. Diga que ainda há vagas mas tá enchendo, recomenda chegar cedo. Mencione que reservar pela próxima vez garante a mesa.'
+    }
+    if (av.isToday && av.status === 'available') {
+      return 'É HOJE e ainda tem boa disponibilidade. Diga que será um prazer receber a família, oriente a chegar dentro do horário e mencione que pra próximas vezes vale reservar pelo app.'
+    }
+    if (av.status === 'full' || av.status === 'blocked') {
+      return av.alternatives.length > 0
+        ? 'Data indisponível. Apresente as alternativas FUTURAS como recomendação POSITIVA (não "consolação") — destaque o que torna esses dias bons (mais tranquilo, brinquedos sem fila, etc.). Conduza ao app pra fechar.'
+        : 'Data indisponível e não há alternativas próximas com vaga. Pergunte se o cliente tem flexibilidade pra outra semana e ofereça consultar pelo app.'
+    }
+    if (av.status === 'busy') {
+      return 'Disponível mas com alta procura. Use escassez de forma elegante: "tá com bastante procura, recomendo garantir hoje pelo app pra não correr risco". Conduza ao app.'
+    }
+    if (av.status === 'available') {
+      return 'Disponível. Confirme com confiança, gere urgência sutil ("vamos garantir logo pelo app"), conduza ao link.'
+    }
+    return 'Não afirme disponibilidade — peça que o cliente confirme via app.'
+  })()
+
+  const availabilityBlock = av
     ? [
-        'Disponibilidade real consultada AGORA no sistema de reservas (use como fato — NÃO invente):',
-        `- data: ${input.availability.date}`,
-        `- status: ${input.availability.status}`,
-        input.availability.capacityLeft !== null
-          ? `- lugares livres: ${input.availability.capacityLeft} de ${input.availability.capacityMax}`
+        `Contexto temporal: HOJE é ${todayBrazil} (horário de Curitiba).`,
+        'Disponibilidade real consultada AGORA no sistema de reservas (use como fato — NÃO invente, NÃO cite números brutos ao cliente):',
+        `- data consultada: ${av.date}${av.isToday ? ' (HOJE)' : av.isPast ? ' (DATA JÁ PASSOU)' : ''}`,
+        `- status: ${av.status}`,
+        av.capacityLeft !== null
+          ? `- lugares livres: ${av.capacityLeft} de ${av.capacityMax}`
           : null,
-        `- mensagem técnica: ${input.availability.message}`,
-        input.availability.alternatives.length > 0
-          ? `- datas alternativas próximas com vaga: ${input.availability.alternatives
+        `- mensagem técnica: ${av.message}`,
+        av.alternatives.length > 0
+          ? `- datas alternativas FUTURAS com vaga: ${av.alternatives
               .map((alt) => `${alt.date} (${alt.capacityLeft} livres)`)
               .join(', ')}`
           : null,
-        input.availability.status === 'full' || input.availability.status === 'blocked'
-          ? 'Informe ao cliente que a data está indisponível e ofereça as alternativas listadas acima.'
-          : input.availability.status === 'busy'
-            ? 'Avise que está com alta procura mas ainda há vagas — incentive confirmar logo.'
-            : input.availability.status === 'available'
-              ? 'Confirme a disponibilidade. Não prometa reserva — peça os dados para encaminhar ao link de reserva.'
-              : 'Não afirme disponibilidade — peça que o cliente confirme via link ou aguarde a equipe.',
+        guidance,
       ]
         .filter(Boolean)
         .join('\n')

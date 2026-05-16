@@ -104,6 +104,26 @@ async function main() {
     const status = booked >= CAPACITY ? 'full' : booked / CAPACITY >= 0.7 ? 'busy' : 'available'
     console.log(`  ${d} → ${booked}/${CAPACITY} (${left} left) [${status}]`)
   }
+
+  // Alternatives forward of TODAY
+  console.log('\nalternatives forward of today (2026-05-16):')
+  const today = '2026-05-16'
+  const candidates: string[] = []
+  for (let offset = 1; offset <= 7; offset += 1) {
+    const d = new Date(`${today}T12:00:00Z`)
+    d.setUTCDate(d.getUTCDate() + offset)
+    candidates.push(d.toISOString().slice(0, 10))
+  }
+  for (const c of candidates) {
+    const booked = bookedByDate.get(c) || 0
+    const left = CAPACITY - booked
+    const status = booked >= CAPACITY ? 'full' : booked / CAPACITY >= 0.7 ? 'busy' : 'available'
+    if (status !== 'full') {
+      console.log(`  ${c} → ${booked}/${CAPACITY} (${left} left) [${status}] ✓ alt candidate`)
+    } else {
+      console.log(`  ${c} → ${booked}/${CAPACITY} [full] skip`)
+    }
+  }
 }
 
 main().catch((err) => {
