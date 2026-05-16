@@ -1052,9 +1052,7 @@ function buildClassifyPrompt(input: {
       `- "shouldHandoff": true APENAS quando o cliente explicitamente pede atendente humano, reclama, faz pedido de exceção/negociação, ou caso operacional sensível (decoração maior, restrição alimentar grave). Reservation_interest com dados completos NÃO é handoff — a IA tem ferramentas pra consultar disponibilidade e conduzir ao app.`,
       `- "shouldCreateLead": true sempre que houver sinal real de visita (reservation_interest, birthday_interest, ou perguntas comerciais com data/grupo). Lead pode ser criado SEM handoff.`,
       `- "leadFields": preencha o que estiver explícito ou claramente inferível na mensagem ou no histórico. Use null quando o cliente NÃO informou. Não invente.`,
-      `- "desiredDate" sempre no formato YYYY-MM-DD; converta datas relativas (hoje, amanhã, sábado) a partir da data de hoje (${new Date()
-        .toISOString()
-        .slice(0, 10)}).`,
+      `- "desiredDate" sempre no formato YYYY-MM-DD; converta datas relativas (hoje, amanhã, sábado) a partir da data de hoje, que é ${getTodayBrazilDate()} (horário de Curitiba). Atenção: a LLUM NÃO abre às sextas-feiras — se o cliente pedir uma data que cai numa sexta, você ainda preenche o desiredDate normalmente (o sistema vai detectar e orientar), mas isso deve ficar claro pra próxima etapa.`,
       `- "desiredTime" sempre HH:MM (24h).`,
       `- "occasion" é livre, máximo 80 chars (ex.: "aniversário 7 anos", "almoço família").`,
       `- "knowledgeTopicsUsed": liste os títulos da base que são realmente relevantes para responder. Lista vazia se nada se aplica.`,
@@ -1128,14 +1126,23 @@ function buildResponderPrompt(input: {
   ].join('\n')
 
   const todayBrazil = getTodayBrazilDate()
+  const weekdayPt = ['domingo', 'segunda-feira', 'terça-feira', 'quarta-feira', 'quinta-feira', 'sexta-feira', 'sábado']
+  const dowOf = (iso: string) => {
+    const d = new Date(`${iso}T12:00:00`)
+    return weekdayPt[d.getUTCDay()] || ''
+  }
+
   const av = input.availability
   const guidance = (() => {
     if (!av) return null
     if (av.isPast) {
       return 'A data pedida JÁ PASSOU. Não responda como se fosse possível reservar. Pergunte se o cliente quer planejar uma nova data e ofereça ajuda pra escolher.'
     }
-    if (av.isToday && (av.status === 'full' || av.status === 'blocked')) {
-      return 'É HOJE e a reserva está esgotada/casa fechada. NÃO sugira datas alternativas distantes — o cliente claramente quer vir hoje. Diga que pra hoje a reserva está esgotada, mas que será uma alegria receber a família — o cliente pode tentar vir presencialmente (ordem de chegada, sujeito à disponibilidade no momento, sem garantia de mesa grande ou acomodação conjunta para grupos). Se ele quiser planejar pra outro dia, aí sim sugira opções.'
+    if (av.status === 'blocked') {
+      return `A LLUM NÃO opera em ${dowOf(av.date)} — a casa está fechada nesse dia da semana. Avise isso com naturalidade ("a gente fecha às sextas, então o dia ${av.date} não rola"), mostre que entendeu o interesse, e ofereça as alternativas próximas como sugestão positiva. NUNCA confirme reserva nesse dia.`
+    }
+    if (av.isToday && av.status === 'full') {
+      return 'É HOJE e a reserva está esgotada. NÃO sugira datas alternativas distantes — o cliente claramente quer vir hoje. Diga que pra hoje a reserva está esgotada, mas que será uma alegria receber a família — o cliente pode tentar vir presencialmente (ordem de chegada, sujeito à disponibilidade no momento, sem garantia de mesa grande ou acomodação conjunta para grupos). Se ele quiser planejar pra outro dia, aí sim sugira opções.'
     }
     if (av.isToday && av.status === 'busy') {
       return 'É HOJE e a casa está com alta procura. Diga que ainda há vagas mas tá enchendo, recomenda chegar cedo. Mencione que reservar pela próxima vez garante a mesa.'
@@ -1143,7 +1150,7 @@ function buildResponderPrompt(input: {
     if (av.isToday && av.status === 'available') {
       return 'É HOJE e ainda tem boa disponibilidade. Diga que será um prazer receber a família, oriente a chegar dentro do horário e mencione que pra próximas vezes vale reservar pelo app.'
     }
-    if (av.status === 'full' || av.status === 'blocked') {
+    if (av.status === 'full') {
       return av.alternatives.length > 0
         ? 'Data indisponível. Apresente as alternativas FUTURAS como recomendação POSITIVA (não "consolação") — destaque o que torna esses dias bons (mais tranquilo, brinquedos sem fila, etc.). Conduza ao app pra fechar.'
         : 'Data indisponível e não há alternativas próximas com vaga. Pergunte se o cliente tem flexibilidade pra outra semana e ofereça consultar pelo app.'
@@ -1159,17 +1166,17 @@ function buildResponderPrompt(input: {
 
   const availabilityBlock = av
     ? [
-        `Contexto temporal: HOJE é ${todayBrazil} (horário de Curitiba).`,
+        `Contexto temporal: HOJE é ${todayBrazil} (${dowOf(todayBrazil)}, horário de Curitiba).`,
         'Disponibilidade real consultada AGORA no sistema de reservas (use como fato — NÃO invente, NÃO cite números brutos ao cliente):',
-        `- data consultada: ${av.date}${av.isToday ? ' (HOJE)' : av.isPast ? ' (DATA JÁ PASSOU)' : ''}`,
+        `- data consultada: ${av.date} (${dowOf(av.date)})${av.isToday ? ' — É HOJE' : av.isPast ? ' — DATA JÁ PASSOU' : ''}`,
         `- status: ${av.status}`,
-        av.capacityLeft !== null
+        av.capacityLeft !== null && av.status !== 'blocked'
           ? `- lugares livres: ${av.capacityLeft} de ${av.capacityMax}`
           : null,
         `- mensagem técnica: ${av.message}`,
         av.alternatives.length > 0
-          ? `- datas alternativas FUTURAS com vaga: ${av.alternatives
-              .map((alt) => `${alt.date} (${alt.capacityLeft} livres)`)
+          ? `- datas alternativas FUTURAS com vaga (já filtradas — todas válidas, sem dias fechados): ${av.alternatives
+              .map((alt) => `${alt.date} (${dowOf(alt.date)}, ${alt.capacityLeft} livres)`)
               .join(', ')}`
           : null,
         guidance,

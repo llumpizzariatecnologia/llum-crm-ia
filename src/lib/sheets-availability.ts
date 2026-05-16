@@ -9,6 +9,17 @@ const CAPACITY_WEEKDAY = Number(process.env.AVAILABILITY_CAPACITY_WEEKDAY ?? '43
 const CAPACITY_SATURDAY = Number(process.env.AVAILABILITY_CAPACITY_SATURDAY ?? CAPACITY_WEEKDAY)
 const CACHE_TTL_MS = Number(process.env.AVAILABILITY_CACHE_TTL_SECONDS ?? '120') * 1000
 
+// Weekdays the house is closed. JavaScript getDay() returns 0=sun, 1=mon, ..., 5=fri, 6=sat.
+// LLUM doesn't open on Friday (5). Override with a comma list like "5,2" if rules change.
+const BLOCKED_WEEKDAYS: Set<number> = new Set(
+  (process.env.AVAILABILITY_BLOCKED_WEEKDAYS ?? '5')
+    .split(',')
+    .map((s) => parseInt(s.trim(), 10))
+    .filter((n) => Number.isFinite(n) && n >= 0 && n <= 6)
+)
+
+const WEEKDAY_PT = ['domingo', 'segunda-feira', 'terça-feira', 'quarta-feira', 'quinta-feira', 'sexta-feira', 'sábado']
+
 type CacheEntry = {
   fetchedAt: number
   bookedByDate: Map<string, number>
@@ -79,7 +90,18 @@ function capacityFor(dateIso: string): number {
   return d.getUTCDay() === 6 ? CAPACITY_SATURDAY : CAPACITY_WEEKDAY
 }
 
-function statusFor(booked: number, max: number, partySize: number | null): AvailabilityStatus {
+function isBlockedDate(dateIso: string): boolean {
+  const d = new Date(`${dateIso}T12:00:00`)
+  return BLOCKED_WEEKDAYS.has(d.getUTCDay())
+}
+
+function weekdayPt(dateIso: string): string {
+  const d = new Date(`${dateIso}T12:00:00`)
+  return WEEKDAY_PT[d.getUTCDay()] || ''
+}
+
+function statusFor(booked: number, max: number, partySize: number | null, blocked: boolean): AvailabilityStatus {
+  if (blocked) return 'blocked'
   if (max <= 0) return 'unknown'
   const left = max - booked
   if (partySize !== null && left < partySize) return 'full'
@@ -142,17 +164,18 @@ function buildMessage(
   max: number,
   left: number
 ): string {
+  const wd = weekdayPt(date)
   switch (status) {
     case 'available':
-      return `Disponível em ${date} (${left} lugares livres de ${max}).`
+      return `Disponível em ${date} (${wd}) — ${left} lugares livres de ${max}.`
     case 'busy':
-      return `Disponível mas com alta procura em ${date} (${left} lugares livres de ${max}).`
+      return `Disponível mas com alta procura em ${date} (${wd}) — ${left} lugares livres de ${max}.`
     case 'full':
-      return `Lotado em ${date} (${booked}/${max} ocupados).`
+      return `Lotado em ${date} (${wd}) — ${booked}/${max} ocupados.`
     case 'blocked':
-      return `Casa fechada em ${date}.`
+      return `Casa fechada em ${date} (${wd}) — LLUM não opera nesse dia da semana.`
     default:
-      return `Sem informações de capacidade para ${date}.`
+      return `Sem informações de capacidade para ${date} (${wd}).`
   }
 }
 
@@ -213,28 +236,30 @@ export async function checkAvailabilityViaSheets(
     }
   }
 
+  const blocked = isBlockedDate(date)
   const max = capacityFor(date)
   const booked = bookedByDate.get(date) || 0
-  const left = Math.max(0, max - booked)
-  const status = statusFor(booked, max, partySize)
+  const left = blocked ? 0 : Math.max(0, max - booked)
+  const status = statusFor(booked, max, partySize, blocked)
 
-  // Suggest alternative dates ONLY in the future when the target is full.
-  // Never suggest past dates, and skip alternatives entirely when the requested
-  // date itself is in the past or today (today-full is handled by the prompt,
-  // not by alt suggestions).
+  // Suggest alternative dates ONLY in the future when the target is unavailable
+  // (full or blocked). Never suggest past dates, never suggest blocked weekdays,
+  // and skip suggestions entirely when the requested date is past or today
+  // (today-full is handled by the prompt, not by alt lists).
   const alternatives: AvailabilityResult['alternatives'] = []
-  if (!isPast && !isToday && status === 'full') {
+  if (!isPast && !isToday && (status === 'full' || status === 'blocked')) {
     const target = new Date(`${date}T12:00:00`)
-    // Search forward up to 7 days (always future of `today`)
-    for (let offset = 1; offset <= 7 && alternatives.length < 4; offset += 1) {
+    // Search forward up to 10 days to leave room for skipping blocked weekdays.
+    for (let offset = 1; offset <= 10 && alternatives.length < 4; offset += 1) {
       const d = new Date(target)
       d.setUTCDate(d.getUTCDate() + offset)
       const altIso = formatIsoDate(d)
       if (altIso <= today) continue
+      if (isBlockedDate(altIso)) continue // never suggest a closed weekday
       const altMax = capacityFor(altIso)
       const altBooked = bookedByDate.get(altIso) || 0
       const altLeft = altMax - altBooked
-      const altStatus = statusFor(altBooked, altMax, partySize)
+      const altStatus = statusFor(altBooked, altMax, partySize, false)
       if (altStatus === 'available' || altStatus === 'busy') {
         alternatives.push({ date: altIso, status: altStatus, capacityLeft: altLeft })
       }
