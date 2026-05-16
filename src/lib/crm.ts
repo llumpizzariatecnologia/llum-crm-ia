@@ -16,7 +16,7 @@ import {
   getWhatsappChannelConfigByPhoneNumberId,
 } from '@/lib/workspace-admin'
 import { searchKnowledgeMatches, type KnowledgeMatch } from '@/lib/knowledge-rag'
-import { checkAvailability, type AvailabilityResult } from '@/lib/reservations'
+import { checkAvailability, type AvailabilityResult } from '@/lib/availability'
 import type {
   AgentRun,
   AgentProfile,
@@ -1354,25 +1354,18 @@ async function classifyWithConfiguredProvider(
   let citations: string[] = []
   let responderUsed = false
 
-  // Tool-call pré-emptivo de disponibilidade. Gated por feature flag porque
-  // o sistema de reservas (`reservas` schema) ainda não está em produção —
-  // habilitar antes disso retornaria dados sintéticos que conflitam com a
-  // realidade do app oficial. Quando o sistema for ao ar, basta exportar
-  // AVAILABILITY_TOOL_ENABLED=true na Vercel.
+  // Tool-call pré-emptivo de disponibilidade. O facade em `@/lib/availability`
+  // decide qual provider usar (sheets, supabase, ou off) via AVAILABILITY_PROVIDER.
+  // Retorna null quando OFF ou em qualquer erro — Maria responde sem inventar.
   let availability: AvailabilityResult | null = null
-  const availabilityToolEnabled = process.env.AVAILABILITY_TOOL_ENABLED === 'true'
   const wantsReservation =
     classification.intent === 'reservation_interest' ||
     classification.intent === 'birthday_interest'
-  if (availabilityToolEnabled && wantsReservation && classification.leadFields.desiredDate) {
-    try {
-      availability = await checkAvailability(
-        classification.leadFields.desiredDate,
-        classification.leadFields.partySize ?? null
-      )
-    } catch {
-      availability = null
-    }
+  if (wantsReservation && classification.leadFields.desiredDate) {
+    availability = await checkAvailability(
+      classification.leadFields.desiredDate,
+      classification.leadFields.partySize ?? null
+    )
   }
 
   if (useCannedHandoffReply) {
