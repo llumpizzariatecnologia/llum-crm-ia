@@ -1048,8 +1048,8 @@ function buildClassifyPrompt(input: {
     )}`,
     [
       'Regras de classificação:',
-      `- "shouldHandoff": true quando o cliente pede humano, reclama, ou quando o intent é reservation_interest e já há dados suficientes (data + número de pessoas).`,
-      `- "shouldCreateLead": true só quando há sinal real de visita (reservation_interest, birthday_interest, ou perguntas comerciais com data/grupo).`,
+      `- "shouldHandoff": true APENAS quando o cliente explicitamente pede atendente humano, reclama, faz pedido de exceção/negociação, ou caso operacional sensível (decoração maior, restrição alimentar grave). Reservation_interest com dados completos NÃO é handoff — a IA tem ferramentas pra consultar disponibilidade e conduzir ao app.`,
+      `- "shouldCreateLead": true sempre que houver sinal real de visita (reservation_interest, birthday_interest, ou perguntas comerciais com data/grupo). Lead pode ser criado SEM handoff.`,
       `- "leadFields": preencha o que estiver explícito ou claramente inferível na mensagem ou no histórico. Use null quando o cliente NÃO informou. Não invente.`,
       `- "desiredDate" sempre no formato YYYY-MM-DD; converta datas relativas (hoje, amanhã, sábado) a partir da data de hoje (${new Date()
         .toISOString()
