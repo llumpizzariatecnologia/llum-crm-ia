@@ -1354,14 +1354,17 @@ async function classifyWithConfiguredProvider(
   let citations: string[] = []
   let responderUsed = false
 
-  // Tool-call pré-emptivo: quando o classifier reconheceu uma data desejada
-  // para reserva, consultamos disponibilidade real ANTES do responder pass.
-  // O resultado vai como fato no prompt — a IA não pode mais inventar capacidade.
+  // Tool-call pré-emptivo de disponibilidade. Gated por feature flag porque
+  // o sistema de reservas (`reservas` schema) ainda não está em produção —
+  // habilitar antes disso retornaria dados sintéticos que conflitam com a
+  // realidade do app oficial. Quando o sistema for ao ar, basta exportar
+  // AVAILABILITY_TOOL_ENABLED=true na Vercel.
   let availability: AvailabilityResult | null = null
+  const availabilityToolEnabled = process.env.AVAILABILITY_TOOL_ENABLED === 'true'
   const wantsReservation =
     classification.intent === 'reservation_interest' ||
     classification.intent === 'birthday_interest'
-  if (wantsReservation && classification.leadFields.desiredDate) {
+  if (availabilityToolEnabled && wantsReservation && classification.leadFields.desiredDate) {
     try {
       availability = await checkAvailability(
         classification.leadFields.desiredDate,
