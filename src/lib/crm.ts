@@ -2390,6 +2390,16 @@ export async function processInboundMessage(input: {
       })
     }
 
+    // Catch the no-send sub-branches (handoff already open, or human owns the
+    // conversation) so the webhook_events row doesn't stay processed=false.
+    if (!shouldSendHandoffReply) {
+      await recordWebhookOutcome(
+        conversation.status === 'human_active'
+          ? 'suppressed_human_active'
+          : 'handoff_already_open'
+      )
+    }
+
     return { customer, conversation, inbound, lead, handoff, agentRun }
   }
 
@@ -2435,6 +2445,9 @@ export async function processInboundMessage(input: {
       sendResult.sendStatus === 'failed' ? 'reply_failed' : 'handled_by_crm_ai',
       sendResult.error
     )
+  } else {
+    // AI disabled globally — log the suppressed event so it isn't stuck pending.
+    await recordWebhookOutcome('suppressed_ai_disabled')
   }
 
   return { customer, conversation, inbound, lead, handoff, agentRun }
